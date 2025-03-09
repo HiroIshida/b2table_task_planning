@@ -87,22 +87,40 @@ if __name__ == "__main__":
     min_costs, min_indices = engine.infer(vectors, table_mat)
     print(f"Time: {time.time() - ts:.2f}s")
 
-    import matplotlib.pyplot as plt
+    visualize = False
+    if visualize:
+        import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots()
-    ax.add_patch(
-        plt.Rectangle(
-            (-0.5 * JskTable.TABLE_DEPTH, -0.5 * JskTable.TABLE_WIDTH),
-            JskTable.TABLE_DEPTH,
-            JskTable.TABLE_WIDTH,
-            fill=False,
+        fig, ax = plt.subplots()
+        ax.add_patch(
+            plt.Rectangle(
+                (-0.5 * JskTable.TABLE_DEPTH, -0.5 * JskTable.TABLE_WIDTH),
+                JskTable.TABLE_DEPTH,
+                JskTable.TABLE_WIDTH,
+                fill=False,
+            )
         )
-    )
 
-    for (x, y, yaw), min_cost in zip(pose_list, min_costs):
-        color = "blue" if min_cost < engine.lib.max_admissible_cost else "red"
-        dx = np.cos(yaw) * 0.03
-        dy = np.sin(yaw) * 0.03
-        ax.arrow(x, y, dx, dy, head_width=0.01, length_includes_head=True, color=color)
-    plt.axis("equal")
-    plt.show()
+        for (x, y, yaw), min_cost in zip(pose_list, min_costs):
+            color = "blue" if min_cost < engine.lib.max_admissible_cost else "red"
+            dx = np.cos(yaw) * 0.03
+            dy = np.sin(yaw) * 0.03
+            ax.arrow(x, y, dx, dy, head_width=0.01, length_includes_head=True, color=color)
+        plt.axis("equal")
+        plt.show()
+    else:
+        domain = Pr2ThesisJskTable
+        solver = domain.solver_type.init(domain.solver_config)
+
+        failure_count = 0
+        total_count = 0
+        for pose, min_cost, min_idx in zip(pose_list, min_costs, min_indices):
+            if min_cost < engine.lib.max_admissible_cost:
+                task.pr2_coords = pose
+                solver.setup(task.export_problem())
+                init_traj = engine.lib.init_solutions[min_idx]
+                res = solver.solve(init_traj)
+                total_count += 1
+                if res.traj is None:
+                    failure_count += 1
+        print(f"Failure rate: {failure_count / total_count:.2f}")
