@@ -1,13 +1,23 @@
 from typing import Optional
 
 import numpy as np
+from plainmp.constraint import SphereCollisionCst
 from plainmp.psdf import BoxSDF, Pose, UnionSDF
-from rpbench.articulated.pr2.thesis_jsk_table import JskMessyTableTask, JskTable
+from plainmp.robot_spec import PR2BaseOnlySpec
+from rpbench.articulated.pr2.thesis_jsk_table import (
+    AV_INIT,
+    JskMessyTableTask,
+    JskTable,
+    fit_radian,
+)
+from rpbench.articulated.world.utils import BoxSkeleton
 from rpbench.planer_box_utils import Box2d, PlanerCoords
 
 
 class SituationSampler:
     table2d_box: Box2d  # to compute 2d sdf of the table
+    table_collision_cst: SphereCollisionCst
+    target_region: BoxSkeleton  # contains all robot, table, and chairs
     tabletop_obstacle_sdf: Optional[UnionSDF]
     reaching_pose: Optional[np.ndarray]
 
@@ -19,6 +29,25 @@ class SituationSampler:
             np.array([JskTable.TABLE_DEPTH * 2, JskTable.TABLE_WIDTH * 2]), co2d
         )  # hypothetical large (doubl size) box
         self.table2d_box = table2d_box
+
+        # setup kin model
+        pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        pr2_spec.get_kin()
+        skmodel = pr2_spec.get_robot_model()
+        skmodel.angle_vector(AV_INIT)
+        pr2_spec.reflect_skrobot_model_to_kin(
+            skmodel
+        )  # NOTE: robot configuration expect for base is fixed
+
+        cst = pr2_spec.create_collision_const()
+        sdf = JskTable().create_sdf()
+        cst.set_sdf(sdf)
+        self.cst = cst
+
+        # target region
+        target_region, table_box2d_wrt_region = JskMessyTableTask._prepare_target_region()
+        self.target_region = target_region
+
         self.tabletop_obstacle_sdf = None
         self.reaching_pose = None
 
@@ -75,5 +104,18 @@ class SituationSampler:
         self.reaching_pose = reaching_pose
         return True
 
-    def sample_pr2_pose(self) -> np.ndarray:
-        ...
+    def sample_pr2_pose(self, n_max_trial: int = 100) -> Optional[np.ndarray]:
+        points = self.target_region.sample_points(n_max_trial)
+        dists = np.linalg.norm(points[:, :2] - self.reaching_pose[:2], axis=1)
+        points_inside = points[dists < 0.8]
+        for point in points_inside:
+            point = point[:2]
+            sd = self.table2d_box.sd(point.reshape(1, 2))[0]
+            if sd > 0.55 or sd < 0.0:
+                continue
+            yaw_reaching = self.reaching_pose[3]
+            yaw = fit_radian(yaw_reaching + np.random.uniform(-np.pi / 4, np.pi / 4))
+            pr2_coords = np.hstack([point, yaw])
+            if self.cst.is_valid(pr2_coords):
+                return pr2_coords
+        return None
