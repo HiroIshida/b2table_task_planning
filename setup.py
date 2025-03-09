@@ -7,7 +7,7 @@ install_requires = [
 ]
 
 setup(
-    name="jsk_table_task_planning",
+    name="b2table_task_planning",
     version="0.0.0",
     description="thesis",
     author="Hirokazu Ishida",

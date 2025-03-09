@@ -10,7 +10,7 @@ from rpbench.articulated.pr2.thesis_jsk_table import JskMessyTableTask, JskTable
 from rpbench.articulated.vision import create_heightmap_z_slice
 from rpbench.articulated.world.utils import BoxSkeleton
 
-from jsk_table_task_planning.sampler import SituationSampler
+from b2table_task_planning.sampler import SituationSampler
 
 
 def create_map_from_obstacle_param(obstacles_param: np.ndarray):

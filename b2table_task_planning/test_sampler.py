@@ -2,7 +2,7 @@ import numpy as np
 import tqdm
 from rpbench.articulated.pr2.thesis_jsk_table import JskMessyTableTask
 
-from jsk_table_task_planning.sampler import SituationSampler
+from b2table_task_planning.sampler import SituationSampler
 
 
 def test_situation_sampler_registration():
