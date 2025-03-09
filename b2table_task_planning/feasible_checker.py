@@ -35,7 +35,7 @@ def create_map_from_obstacle_param(obstacles_param: np.ndarray):
     return table_mat
 
 
-class InferenceEngine:
+class FeasibilityChecker:
     lib: SolutionLibrary
 
     def __init__(self):
@@ -60,14 +60,17 @@ class InferenceEngine:
             costs = pred.forward((encoded_repeated, vectors_cuda))[0]
             costs_arr[i] = costs.flatten() + bias
         min_costs, min_indices = torch.min(costs_arr, dim=0)
-        return min_costs.cpu().detach().numpy(), min_indices.cpu().detach().numpy()
+        return (
+            min_costs.cpu().detach().numpy() < self.lib.max_admissible_cost,
+            min_indices.cpu().detach().numpy(),
+        )
 
 
 if __name__ == "__main__":
     sampler = SituationSampler()
     task = JskMessyTableTask.sample()
 
-    engine = InferenceEngine()
+    engine = FeasibilityChecker()
 
     ts = time.time()
     sampler.register_tabletop_obstacles(task.obstacles_param)
@@ -84,10 +87,10 @@ if __name__ == "__main__":
     reaching_pose_tile = np.tile(task.reaching_pose, (pose_list.shape[0], 1))
     vectors = np.concatenate([pose_list, reaching_pose_tile], axis=1)
 
-    min_costs, min_indices = engine.infer(vectors, table_mat)
+    is_feasibiles, min_indices = engine.infer(vectors, table_mat)
     print(f"Time: {time.time() - ts:.2f}s")
 
-    visualize = False
+    visualize = True
     if visualize:
         import matplotlib.pyplot as plt
 
@@ -101,8 +104,8 @@ if __name__ == "__main__":
             )
         )
 
-        for (x, y, yaw), min_cost in zip(pose_list, min_costs):
-            color = "blue" if min_cost < engine.lib.max_admissible_cost else "red"
+        for (x, y, yaw), is_feasible in zip(pose_list, is_feasibiles):
+            color = "blue" if is_feasible else "red"
             dx = np.cos(yaw) * 0.03
             dy = np.sin(yaw) * 0.03
             ax.arrow(x, y, dx, dy, head_width=0.01, length_includes_head=True, color=color)
@@ -114,8 +117,8 @@ if __name__ == "__main__":
 
         failure_count = 0
         total_count = 0
-        for pose, min_cost, min_idx in zip(pose_list, min_costs, min_indices):
-            if min_cost < engine.lib.max_admissible_cost:
+        for pose, is_feasible, min_idx in zip(pose_list, is_feasibiles, min_indices):
+            if is_feasible:
                 task.pr2_coords = pose
                 solver.setup(task.export_problem())
                 init_traj = engine.lib.init_solutions[min_idx]
