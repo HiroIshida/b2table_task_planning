@@ -1,4 +1,6 @@
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -8,6 +10,7 @@ from hifuku.domain import Pr2ThesisJskTable, Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import PR2BaseOnlySpec, PR2LarmSpec, PR2RarmSpec
+from plainmp.trajectory import Trajectory
 from rpbench.articulated.pr2.thesis_jsk_table import (
     AV_INIT,
     JskChair,
@@ -149,103 +152,124 @@ class FeasibilityChecker:
         )
 
 
-if __name__ == "__main__":
-    sampler = SituationSampler()
-    task = barely_feasible_task()
-    chair_manager = ChairManager()
+@dataclass
+class TaskPlannerConfig:
+    n_sample_pose: int = 1000
 
-    engine = FeasibilityChecker()
 
-    sampler.register_tabletop_obstacles(task.obstacles_param)
-    sampler.register_reaching_pose(task.reaching_pose)
-    table_mat = create_map_from_obstacle_param(task.obstacles_param)
-    ground_mat = create_map_from_chair_param(task.chairs_param)
+@dataclass
+class TaskAndMotionPlan:
+    pr2_pose: np.ndarray
+    traj: Trajectory
+    rarm: bool
 
-    pose_list = []
-    for _ in tqdm.tqdm(range(1000)):
-        pose = sampler.sample_pr2_pose()
-        if pose is not None:
-            pose_list.append(pose)
-    pose_list = np.array(pose_list)
 
-    chair_manager.set_param(task.chairs_param)
-    sdf = chair_manager.create_sdf()
+class TaskPlanner:
+    sampler: SituationSampler
+    task: JskMessyTableTask
+    chair_manager: ChairManager
+    engine: FeasibilityChecker
+    config: TaskPlannerConfig
 
-    pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-    pr2_spec.get_kin()
-    skmodel = pr2_spec.get_robot_model()
-    skmodel.angle_vector(AV_INIT)
-    pr2_spec.reflect_skrobot_model_to_kin(
-        skmodel
-    )  # NOTE: robot configuration expect for base is fixed
-    cst = pr2_spec.create_collision_const()
-    cst.set_sdf(sdf)
+    def __init__(self, config: TaskPlannerConfig = TaskPlannerConfig()):
+        self.sampler = SituationSampler()
+        self.chair_manager = ChairManager()
+        self.engine = FeasibilityChecker()
+        self.config = config
 
-    valid_pose_list = []
-    for pose in pose_list:
-        valid = cst.is_valid(pose)
-        if valid:
-            valid_pose_list.append(pose)
-    valid_pose_list = np.array(valid_pose_list)
+    def plan(
+        self, reaching_pose: np.ndarray, obstacles_param: np.ndarray, chairs_param: np.ndarray
+    ) -> Optional[TaskAndMotionPlan]:
 
-    reaching_pose_tile = np.tile(task.reaching_pose, (valid_pose_list.shape[0], 1))
-    vectors = np.concatenate([valid_pose_list, reaching_pose_tile], axis=1)
+        # here we assume that only chair is movable
+        self.sampler.register_tabletop_obstacles(obstacles_param)
+        self.sampler.register_reaching_pose(reaching_pose)
+        self.chair_manager.set_param(chairs_param)
+        pr2_pose_cands = self._sample_pr2_pose()
+        if pr2_pose_cands is None:
+            return None  # no solution found
+        placable_pr2_poses = self._select_placable_poses(pr2_pose_cands)
 
-    is_feasibiles, min_indices = engine.infer(vectors, table_mat, ground_mat)
+        if placable_pr2_poses is None:
+            raise NotImplementedError("No placable pose found")  # TODO: handle this case
 
-    visualize = False
-    if visualize:
-        import matplotlib.pyplot as plt
+        # finally
+        table_mat = create_map_from_obstacle_param(obstacles_param)
+        ground_mat = create_map_from_chair_param(chairs_param)
 
-        fig, ax = plt.subplots()
-        ax.add_patch(
-            plt.Rectangle(
-                (-0.5 * JskTable.TABLE_DEPTH, -0.5 * JskTable.TABLE_WIDTH),
-                JskTable.TABLE_DEPTH,
-                JskTable.TABLE_WIDTH,
-                fill=False,
-            )
-        )
+        reaching_pose_tile = np.tile(reaching_pose, (placable_pr2_poses.shape[0], 1))
+        vectors = np.concatenate([placable_pr2_poses, reaching_pose_tile], axis=1)
+        is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
+        # solve???
+        print("reach here")
 
-        for (x, y, yaww) in pose_list:
-            color = "gray"
-            dx = np.cos(yaww) * 0.03
-            dy = np.sin(yaww) * 0.03
-            ax.arrow(x, y, dx, dy, head_width=0.01, length_includes_head=True, color=color)
-
-        for (x, y, yaw), is_feasible in zip(valid_pose_list, is_feasibiles):
-            color = "blue" if is_feasible else "red"
-            dx = np.cos(yaw) * 0.03
-            dy = np.sin(yaw) * 0.03
-            ax.arrow(x, y, dx, dy, head_width=0.01, length_includes_head=True, color=color)
-
-        plt.axis("equal")
-        plt.show()
-    else:
-        domain = Pr2ThesisJskTable
-        solver = domain.solver_type.init(domain.solver_config)
-        for pose, is_feasible, min_idx in zip(valid_pose_list, is_feasibiles, min_indices):
+        for pose, is_feasible, min_idx in zip(placable_pr2_poses, is_feasibiles, min_indices):
             if is_feasible:
-                task.pr2_coords = pose
+                task = JskMessyTableTaskWithChair(
+                    obstacles_param, chairs_param, pose, reaching_pose
+                )
+                solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(task.export_problem())
-                init_traj = engine.lib.init_solutions[min_idx]
+                init_traj = self.engine.lib.init_solutions[min_idx]
                 res = solver.solve(init_traj)
-                if task.is_using_rarm():
-                    spec = PR2RarmSpec()
-                else:
-                    spec = PR2LarmSpec()
-                v = PyrenderViewer()
-                task.visualize(v)
-                pr2 = PR2(use_tight_joint_limit=False)
-                pr2.angle_vector(AV_INIT)
-                pr2.newcoords(Coordinates([pose[0], pose[1], 0.0], [pose[2], 0.0, 0.0]))
-                v.add(pr2)
-                v.show()
-                time.sleep(2)
-                for q in res.traj:
-                    spec.set_skrobot_model_state(pr2, q)
-                    v.redraw()
-                    time.sleep(0.05)
-                import time
+                if res.traj is not None:
+                    return TaskAndMotionPlan(
+                        pr2_pose=pose, traj=res.traj, rarm=task.is_using_rarm()
+                    )
 
-                time.sleep(1000)
+    def _sample_pr2_pose(self) -> Optional[np.ndarray]:
+        pose_list = []
+        for _ in tqdm.tqdm(range(self.config.n_sample_pose)):
+            pose = self.sampler.sample_pr2_pose()
+            if pose is not None:
+                pose_list.append(pose)
+        if len(pose_list) == 0:
+            return None  # no solution found
+        pose_list = np.array(pose_list)
+        return pose_list
+
+    def _select_placable_poses(self, pose_list: np.ndarray) -> Optional[np.ndarray]:
+        # check if robot is placable at the sampled pose
+        chairs_sdf = self.chair_manager.create_sdf()
+
+        pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        pr2_spec.get_kin()
+        skmodel = pr2_spec.get_robot_model()
+        skmodel.angle_vector(AV_INIT)
+        pr2_spec.reflect_skrobot_model_to_kin(skmodel)
+        cst = pr2_spec.create_collision_const()
+        cst.set_sdf(chairs_sdf)
+
+        valid_pose_list = []
+        for pose in pose_list:
+            if cst.is_valid(pose):
+                valid_pose_list.append(pose)
+        if len(valid_pose_list) == 0:
+            return None
+        valid_pose_list = np.array(valid_pose_list)
+        return valid_pose_list
+
+
+if __name__ == "__main__":
+    task = barely_feasible_task()
+    task_planner = TaskPlanner()
+    plan = task_planner.plan(task.reaching_pose, task.obstacles_param, task.chairs_param)
+    print(plan)
+
+    if plan is not None:
+        spec = PR2RarmSpec() if plan.rarm else PR2LarmSpec()
+        v = PyrenderViewer()
+        task.visualize(v)
+        pr2 = PR2(use_tight_joint_limit=False)
+        pr2.angle_vector(AV_INIT)
+        pr2.newcoords(
+            Coordinates([plan.pr2_pose[0], plan.pr2_pose[1], 0.0], [plan.pr2_pose[2], 0.0, 0.0])
+        )
+        v.add(pr2)
+        v.show()
+        time.sleep(2)
+        for q in plan.traj:
+            spec.set_skrobot_model_state(pr2, q)
+            v.redraw()
+            time.sleep(0.05)
+        time.sleep(1000)
