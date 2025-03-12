@@ -26,7 +26,7 @@ from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
 from b2table_task_planning.sampler import SituationSampler
-from b2table_task_planning.scenario import barely_feasible_task
+from b2table_task_planning.scenario import need_fix_task
 
 
 def create_map_from_obstacle_param(obstacles_param: np.ndarray):
@@ -98,18 +98,19 @@ class _FeasibilityChecker:
 class ChairManager:
     def __init__(self):
         n_max_chair = JskMessyTableTaskWithChair.N_MAX_CHAIR
+        self.chairs_param = None
         self.chairs = [JskChair() for _ in range(n_max_chair)]
         self.sdfs = [None for _ in range(n_max_chair)]
         self.n_chair = 0
 
     def set_param(self, chairs_param: np.ndarray):
+        self.chairs_param = chairs_param
         reshaped = chairs_param.reshape(-1, 3)
         n_chair = reshaped.shape[0]
         self.n_chair = n_chair
         for i in range(n_chair):
             x, y, yaw = reshaped[i]
             self.chairs[i].newcoords(Coordinates([x, y, 0.0], [yaw, 0.0, 0.0]))
-            print(x, y, yaw)
             self.sdfs[i] = self.chairs[i].create_sdf()
 
     def create_sdf(self) -> UnionSDF:
@@ -202,7 +203,13 @@ class TaskPlanner:
         placable_pr2_poses = self._select_reachable_poses(pr2_pose_now, pr2_pose_cands)
 
         if placable_pr2_poses is None:
-            raise NotImplementedError("No placable pose found")  # TODO: handle this case
+            self._determine_remove_chairs(
+                pr2_pose_now,
+                reaching_pose,
+                pr2_pose_cands,
+                create_map_from_obstacle_param(obstacles_param),
+            )
+            assert False
 
         # finally
         table_mat = create_map_from_obstacle_param(obstacles_param)
@@ -214,7 +221,8 @@ class TaskPlanner:
 
         # check if any feasible solution exists
         if not np.any(is_feasibiles):
-            return NotImplementedError("No feasible solution found")
+            self._determine_remove_chairs(pr2_pose_now, reaching_pose, pr2_pose_cands, table_mat)
+            assert False
 
         print("now the phase of finding feasible solution by actually solving the problem")
         for pose, is_feasible, min_idx in zip(placable_pr2_poses, is_feasibiles, min_indices):
@@ -250,8 +258,7 @@ class TaskPlanner:
         sdf.merge(self.table.create_sdf())
 
         pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-        pr2_spec.get_kin()
-        skmodel = pr2_spec.get_robot_model()
+        skmodel = pr2_spec.get_robot_model(deepcopy=False)
         skmodel.angle_vector(AV_INIT)
         pr2_spec.reflect_skrobot_model_to_kin(skmodel)
         cst = pr2_spec.create_collision_const()
@@ -261,12 +268,55 @@ class TaskPlanner:
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
         return pose_list[bools]
 
-    def _determine_remove_chair(self, pose: np.ndarray):
-        pass
+    def _determine_remove_chairs(
+        self,
+        current_pose: np.ndarray,
+        reaching_pose: np.ndarray,
+        pose_list: np.ndarray,
+        table_mat: np.ndarray,
+    ) -> np.ndarray:
+        assert len(pose_list) > 0
+        pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        skmodel = pr2_spec.get_robot_model(deepcopy=False)
+        skmodel.angle_vector(AV_INIT)
+        pr2_spec.reflect_skrobot_model_to_kin(skmodel)
+        cst = pr2_spec.create_collision_const()
+        original_chairs_param = self.chair_manager.chairs_param
+        for i_chair in range(self.chair_manager.n_chair):
+            # tweak chairs param
+            chairs_param = original_chairs_param.copy().reshape(-1, 3)
+            chairs_param = np.delete(chairs_param, i_chair, axis=0)
+            chairs_param = chairs_param.flatten()
+            self.chair_manager.set_param(chairs_param)
+            cst.set_sdf(self.chair_manager.create_sdf())
+            from pyinstrument import Profiler
+
+            profiler = Profiler()
+            profiler.start()
+            tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 500)
+            profiler.stop()
+            print(profiler.output_text(unicode=True, color=True, show_all=False))
+            bools = tree.is_reachable_batch(pose_list.T, 0.5)
+            reachable_poses = pose_list[bools]
+
+            if len(pose_list) == 0:
+                continue
+            print(f"find reachable poses after removing chair {i_chair}")
+            ground_mat = create_map_from_chair_param(chairs_param)
+            reaching_pose_tile = np.tile(reaching_pose, (reachable_poses.shape[0], 1))
+            vectors = np.concatenate([reachable_poses, reaching_pose_tile], axis=1)
+            is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
+            if np.any(is_feasibiles):
+                # check if removable is feasible
+                print(f"chair {i_chair} is removable")
+                return i_chair
+
+        # increase number of chairs to remove
 
 
 if __name__ == "__main__":
-    task = barely_feasible_task()
+    # task = barely_feasible_task()
+    task = need_fix_task()
     task_planner = TaskPlanner()
 
     start = np.array([0.784, 2.57, -2.0])
