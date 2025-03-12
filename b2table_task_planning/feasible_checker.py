@@ -8,6 +8,7 @@ import tqdm
 from hifuku.core import SolutionLibrary
 from hifuku.domain import Pr2ThesisJskTable, Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
+from plainmp.experimental import MultiGoalRRT
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import PR2BaseOnlySpec, PR2LarmSpec, PR2RarmSpec
 from plainmp.trajectory import Trajectory
@@ -166,7 +167,6 @@ class TaskAndMotionPlan:
 
 class TaskPlanner:
     sampler: SituationSampler
-    task: JskMessyTableTask
     chair_manager: ChairManager
     engine: FeasibilityChecker
     config: TaskPlannerConfig
@@ -176,9 +176,20 @@ class TaskPlanner:
         self.chair_manager = ChairManager()
         self.engine = FeasibilityChecker()
         self.config = config
+        self.table = JskTable()
+
+        target_region, _ = JskMessyTableTaskWithChair._prepare_target_region()
+        region_lb = target_region.worldpos() - 0.5 * target_region.extents
+        region_ub = target_region.worldpos() + 0.5 * target_region.extents
+        self.pr2_pose_lb = np.hstack([region_lb[:2], [-np.pi * 1.5]])
+        self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
 
     def plan(
-        self, reaching_pose: np.ndarray, obstacles_param: np.ndarray, chairs_param: np.ndarray
+        self,
+        pr2_pose_now: np.ndarray,
+        reaching_pose: np.ndarray,
+        obstacles_param: np.ndarray,
+        chairs_param: np.ndarray,
     ) -> Optional[TaskAndMotionPlan]:
 
         # here we assume that only chair is movable
@@ -188,7 +199,7 @@ class TaskPlanner:
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
-        placable_pr2_poses = self._select_placable_poses(pr2_pose_cands)
+        placable_pr2_poses = self._select_reachable_poses(pr2_pose_now, pr2_pose_cands)
 
         if placable_pr2_poses is None:
             raise NotImplementedError("No placable pose found")  # TODO: handle this case
@@ -200,9 +211,12 @@ class TaskPlanner:
         reaching_pose_tile = np.tile(reaching_pose, (placable_pr2_poses.shape[0], 1))
         vectors = np.concatenate([placable_pr2_poses, reaching_pose_tile], axis=1)
         is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
-        # solve???
-        print("reach here")
 
+        # check if any feasible solution exists
+        if not np.any(is_feasibiles):
+            return NotImplementedError("No feasible solution found")
+
+        print("now the phase of finding feasible solution by actually solving the problem")
         for pose, is_feasible, min_idx in zip(placable_pr2_poses, is_feasibiles, min_indices):
             if is_feasible:
                 task = JskMessyTableTaskWithChair(
@@ -228,9 +242,12 @@ class TaskPlanner:
         pose_list = np.array(pose_list)
         return pose_list
 
-    def _select_placable_poses(self, pose_list: np.ndarray) -> Optional[np.ndarray]:
+    def _select_reachable_poses(
+        self, current_pose: np.ndarray, pose_list: np.ndarray
+    ) -> Optional[np.ndarray]:
         # check if robot is placable at the sampled pose
-        chairs_sdf = self.chair_manager.create_sdf()
+        sdf = self.chair_manager.create_sdf()
+        sdf.merge(self.table.create_sdf())
 
         pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
         pr2_spec.get_kin()
@@ -238,23 +255,24 @@ class TaskPlanner:
         skmodel.angle_vector(AV_INIT)
         pr2_spec.reflect_skrobot_model_to_kin(skmodel)
         cst = pr2_spec.create_collision_const()
-        cst.set_sdf(chairs_sdf)
+        cst.set_sdf(sdf)
 
-        valid_pose_list = []
-        for pose in pose_list:
-            if cst.is_valid(pose):
-                valid_pose_list.append(pose)
-        if len(valid_pose_list) == 0:
-            return None
-        valid_pose_list = np.array(valid_pose_list)
-        return valid_pose_list
+        tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 1000)
+        bools = tree.is_reachable_batch(pose_list.T, 0.5)
+        return pose_list[bools]
+
+    def _determine_remove_chair(self, pose: np.ndarray):
+        pass
 
 
 if __name__ == "__main__":
     task = barely_feasible_task()
     task_planner = TaskPlanner()
-    plan = task_planner.plan(task.reaching_pose, task.obstacles_param, task.chairs_param)
-    print(plan)
+
+    start = np.array([0.784, 2.57, -2.0])
+    ts = time.time()
+    plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
+    print(f"Time: {time.time() - ts}")
 
     if plan is not None:
         spec = PR2RarmSpec() if plan.rarm else PR2LarmSpec()
