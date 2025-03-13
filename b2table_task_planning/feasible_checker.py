@@ -6,8 +6,9 @@ import numpy as np
 import torch
 import tqdm
 from hifuku.core import SolutionLibrary
-from hifuku.domain import Pr2ThesisJskTable, Pr2ThesisJskTable2
+from hifuku.domain import Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
+from plainmp.constraint import SphereCollisionCst
 from plainmp.experimental import MultiGoalRRT
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import PR2BaseOnlySpec, PR2LarmSpec, PR2RarmSpec
@@ -62,37 +63,6 @@ def create_map_from_chair_param(chairs_param: np.ndarray):
         primitives.extend(chair.chair_primitives)
     ground_mat = create_heightmap_z_slice(ground_region, primitives, 112)
     return ground_mat
-
-
-class _FeasibilityChecker:
-    lib: SolutionLibrary
-
-    def __init__(self):
-        self.lib = load_library(Pr2ThesisJskTable, "cuda", postfix="0.2")
-        # Not jit compiled intentionally becaues input shape is not fixed
-        task = JskMessyTableTask.sample()
-        for _ in range(10):  # warm up
-            self.lib.infer(task)
-
-    def infer(self, vectors: np.ndarray, table_mat: np.ndarray):
-        assert self.lib.ae_model_shared is not None
-        vectors_cuda = torch.from_numpy(vectors).float().cuda()
-        table_mat_cuda = torch.from_numpy(table_mat).float().cuda().unsqueeze(0).unsqueeze(0)
-        encoded = self.lib.ae_model_shared.forward(table_mat_cuda)
-        n_batch = vectors_cuda.shape[0]
-        encoded_repeated = encoded.repeat(n_batch, 1)
-
-        costs_arr = torch.zeros(len(self.lib.predictors), n_batch).float().cuda()
-        for i in range(len(self.lib.predictors)):
-            pred = self.lib.predictors[i]
-            bias = self.lib.biases[i]
-            costs = pred.forward((encoded_repeated, vectors_cuda))[0]
-            costs_arr[i] = costs.flatten() + bias
-        min_costs, min_indices = torch.min(costs_arr, dim=0)
-        return (
-            min_costs.cpu().detach().numpy() < self.lib.max_admissible_cost,
-            min_indices.cpu().detach().numpy(),
-        )
 
 
 class ChairManager:
@@ -171,6 +141,9 @@ class TaskPlanner:
     chair_manager: ChairManager
     engine: FeasibilityChecker
     config: TaskPlannerConfig
+    table: JskTable
+    pr2_pose_lb: np.ndarray
+    pr2_pose_ub: np.ndarray
 
     def __init__(self, config: TaskPlannerConfig = TaskPlannerConfig()):
         self.sampler = SituationSampler()
@@ -200,35 +173,51 @@ class TaskPlanner:
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
-        placable_pr2_poses = self._select_reachable_poses(pr2_pose_now, pr2_pose_cands)
+        recahable_pr2_poses = self._select_reachable_poses(pr2_pose_now, pr2_pose_cands)
 
-        if placable_pr2_poses is None:
-            self._determine_remove_chairs(
+        if recahable_pr2_poses is None:
+            rplanner = RepairPlanner(
                 pr2_pose_now,
-                reaching_pose,
                 pr2_pose_cands,
+                reaching_pose,
+                self.chair_manager,
+                self.engine,
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
                 obstacles_param,
+                self.table,
                 create_map_from_obstacle_param(obstacles_param),
             )
+            rplanner.plan(chairs_param)
             assert False
 
         # finally
         table_mat = create_map_from_obstacle_param(obstacles_param)
         ground_mat = create_map_from_chair_param(chairs_param)
 
-        reaching_pose_tile = np.tile(reaching_pose, (placable_pr2_poses.shape[0], 1))
-        vectors = np.concatenate([placable_pr2_poses, reaching_pose_tile], axis=1)
+        reaching_pose_tile = np.tile(reaching_pose, (recahable_pr2_poses.shape[0], 1))
+        vectors = np.concatenate([recahable_pr2_poses, reaching_pose_tile], axis=1)
         is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
 
         # check if any feasible solution exists
         if not np.any(is_feasibiles):
-            self._determine_remove_chairs(
-                pr2_pose_now, reaching_pose, pr2_pose_cands, obstacles_param, table_mat
+            rplanner = RepairPlanner(
+                pr2_pose_now,
+                pr2_pose_cands,
+                reaching_pose,
+                self.chair_manager,
+                self.engine,
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                obstacles_param,
+                self.table,
+                table_mat,
             )
+            rplanner.plan(chairs_param)
             assert False
 
         print("now the phase of finding feasible solution by actually solving the problem")
-        for pose, is_feasible, min_idx in zip(placable_pr2_poses, is_feasibiles, min_indices):
+        for pose, is_feasible, min_idx in zip(recahable_pr2_poses, is_feasibiles, min_indices):
             if is_feasible:
                 task = JskMessyTableTaskWithChair(
                     obstacles_param, chairs_param, pose, reaching_pose
@@ -271,62 +260,106 @@ class TaskPlanner:
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
         return pose_list[bools]
 
-    def _determine_remove_chairs(
-        self,
-        current_pose: np.ndarray,
-        reaching_pose: np.ndarray,
-        pose_list: np.ndarray,
-        obstacles_param: np.ndarray,
-        table_mat: np.ndarray,
-    ) -> np.ndarray:
-        assert len(pose_list) > 0
-        pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-        skmodel = pr2_spec.get_robot_model(deepcopy=False)
-        skmodel.angle_vector(AV_INIT)
-        pr2_spec.reflect_skrobot_model_to_kin(skmodel)
-        cst = pr2_spec.create_collision_const()
-        original_chairs_param = self.chair_manager.chairs_param
-        for i_chair in range(self.chair_manager.n_chair):
-            # tweak chairs param
-            chairs_param = original_chairs_param.copy().reshape(-1, 3)
-            chairs_param = np.delete(chairs_param, i_chair, axis=0)
-            chairs_param = chairs_param.flatten()
-            print(f"chair_param: {chairs_param}")
 
-            self.chair_manager.set_param(chairs_param)
+class RepairPlanner:
+    init_pr2_pose: np.ndarray
+    final_pr2_pose_cands: np.ndarray
+    final_gripper_pose: np.ndarray
+    chair_manager: ChairManager
+    engine: FeasibilityChecker
+    pr2_pose_lb: np.ndarray
+    pr2_pose_ub: np.ndarray
+    obstacle_param: np.ndarray
+    table: JskTable
+    table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
+    collision_cst_base_only: SphereCollisionCst
+
+    def __init__(
+        self,
+        init_pr2_pose: np.ndarray,
+        final_pr2_pose_cands: np.ndarray,
+        final_gripper_pose: np.ndarray,
+        chair_manager: ChairManager,
+        engine: FeasibilityChecker,
+        pr2_pose_lb: np.ndarray,
+        pr2_pose_ub: np.ndarray,
+        obstacle_param: np.ndarray,
+        table: JskTable,
+        table_mat: np.ndarray,
+    ):
+        self.init_pr2_pose = init_pr2_pose
+        self.final_pr2_pose_cands = final_pr2_pose_cands
+        self.final_gripper_pose = final_gripper_pose
+        self.chair_manager = chair_manager
+        self.engine = engine
+        self.pr2_pose_lb = pr2_pose_lb
+        self.pr2_pose_ub = pr2_pose_ub
+        self.obstacle_param = obstacle_param
+        self.table = table
+        self.table_mat = table_mat
+
+        # prepare collision constraint
+        spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        skmodel = spec.get_robot_model(deepcopy=False)
+        skmodel.angle_vector(AV_INIT)
+        spec.reflect_skrobot_model_to_kin(skmodel)
+        self.collision_cst_base_only = spec.create_collision_const()
+
+        # prepare chair-attached collision constraint
+        # TODDO
+
+    def plan(self, chairs_param_original: np.ndarray) -> int:
+        n_chair = len(chairs_param_original) // 3
+        for i_chair in range(n_chair):
+            chair_pose_remove = chairs_param_original[i_chair * 3 : (i_chair + 1) * 3]
+            chairs_param_hypo = np.delete(
+                chairs_param_original, np.s_[3 * i_chair : 3 * i_chair + 3]
+            )
+            self.chair_manager.set_param(chairs_param_hypo)
             sdf = self.chair_manager.create_sdf()
             sdf.merge(self.table.create_sdf())
-            cst.set_sdf(sdf)
+            self.collision_cst_base_only.set_sdf(sdf)
 
-            tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 500)
-            bools = tree.is_reachable_batch(pose_list.T, 0.5)
-            reachable_poses = pose_list[bools]
-            if len(reachable_poses) == 0:
-                continue
-            print(f"find reachable poses after removing chair {i_chair}")
-            ground_mat = create_map_from_chair_param(chairs_param)
-            reaching_pose_tile = np.tile(reaching_pose, (reachable_poses.shape[0], 1))
-            vectors = np.concatenate([reachable_poses, reaching_pose_tile], axis=1)
-            is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
-
-            if not np.any(is_feasibiles):
-                continue
-
-            blocking_chair_pose = original_chairs_param[i_chair * 3 : (i_chair + 1) * 3]
-            pre_grasp_base_pose = self._determine_pregrasp_chair_pr2_base_pose(
-                blocking_chair_pose, tree
+            # first check if the robot base can reach the goal
+            tree = MultiGoalRRT(
+                self.init_pr2_pose,
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                self.collision_cst_base_only,
+                500,
             )
+            bools = tree.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
+            reachable_poses = self.final_pr2_pose_cands[bools]
+            if len(reachable_poses) == 0:
+                print("no reachable poses")
+                continue
 
-            # Now among the many pr2_final_pose we find the one that is actually feasible
-            # if the chair is removed
-            selected_pr2_final_pose = None
+            # check if the robot arm can reach the goal pose
+            ground_mat = create_map_from_chair_param(chairs_param_hypo)
+            gripper_pose_tile = np.tile(self.final_gripper_pose, (reachable_poses.shape[0], 1))
+            vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
+            is_feasibiles, min_indices = self.engine.infer(vectors, self.table_mat, ground_mat)
+            if not np.any(is_feasibiles):
+                print("no feasible poses")
+                continue
+
+            # check if i_chair can be graspable
+            chair_remove_start_pr2_pose = self.determine_pregrasp_chair_pr2_base_pose(
+                chair_pose_remove, tree
+            )
+            if chair_remove_start_pr2_pose is None:
+                print("no feasible pregrasp pose")
+                continue
+
+            # check if the detected situation is feasible by actually solving the problem
+            feasible_pr2_final_pose = None
             for pr2_final_pose, is_feasible, min_idx in zip(
                 reachable_poses, is_feasibiles, min_indices
             ):
                 if not is_feasible:
                     continue
                 task = JskMessyTableTaskWithChair(
-                    obstacles_param, chairs_param, pr2_final_pose, reaching_pose
+                    self.obstacle_param, chairs_param_hypo, pr2_final_pose, self.final_gripper_pose
                 )
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(task.export_problem())
@@ -334,44 +367,21 @@ class TaskPlanner:
                 res = solver.solve(init_traj)
                 if res.traj is None:
                     continue
-                selected_pr2_final_pose = pr2_final_pose
+                feasible_pr2_final_pose = pr2_final_pose
                 break
-            if selected_pr2_final_pose is None:
+            if feasible_pr2_final_pose is None:
+                print("no feasible final pose")
                 continue
 
-            # OK. now assuming that the chair is removed, we make a plan from current pose to the selected final pose
-            # Actually MultiGoalRRT already has the information of the path from current pose to the selected final pose
-            # So we just retrieve the path.
-            assert tree.is_reachable(selected_pr2_final_pose, 0.5)
-            solution = tree.get_solution(selected_pr2_final_pose).T
+            # NOTE: In this stage, we are almost sure that the problem is solvable
+            # Next thing to do is just determine where to place the chair (and is bit complicated)
+            print("success")
+            return
+        assert False
 
-            # generate randomized pose of the blocking chair and see if any of them does not block the path
-            # generate 30 random poses and sort it in the order of the distance from the original pose
-            rand_lb = np.array([-1.0, -1.0, -0.5 * np.pi])
-            rand_ub = np.array([1.0, 1.0, 0.5 * np.pi])
-            N_random_move = 30
-            rands = np.random.uniform(rand_lb, rand_ub, (N_random_move, 3))
-            dists = np.linalg.norm(rands - blocking_chair_pose, axis=1)
-            sorted_indices = np.argsort(dists)
-            print(f"sorted_indices: {rands[sorted_indices]}")
-            for i in sorted_indices:
-                blocking_chair_pose_rand = blocking_chair_pose + rands[i]
-                # NOTE: because we know that solution does not collide with other chairs,
-                # so we only care about the collision with the blocking chair
-                self.chair_manager.set_param(blocking_chair_pose_rand)
-                sdf = self.chair_manager.create_sdf()
-                cst.set_sdf(sdf)
-
-                dont_blocking = np.all([cst.is_valid(q) for q in solution])
-                if dont_blocking:
-                    print("found a solution")
-                    return
-                print("failure!")
-
-        assert False, "planning failed"
-
-    def _determine_pregrasp_chair_pr2_base_pose(
-        self, chair_pose: np.ndarray, tree: MultiGoalRRT
+    @staticmethod
+    def determine_pregrasp_chair_pr2_base_pose(
+        chair_pose: np.ndarray, tree: MultiGoalRRT
     ) -> Optional[np.ndarray]:
         # check if blocking chair is actually removable by
         # hypothetically chaing the chair yaw angles
