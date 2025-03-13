@@ -10,6 +10,8 @@ from hifuku.domain import Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
 from plainmp.constraint import SphereCollisionCst
 from plainmp.experimental import MultiGoalRRT
+from plainmp.ompl_solver import OMPLSolver, OMPLSolverConfig
+from plainmp.problem import Problem
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import (
     PR2BaseOnlySpec,
@@ -141,6 +143,15 @@ class TaskAndMotionPlan:
     rarm: bool
 
 
+@dataclass
+class PlanningResult:
+    joint_path_final: Optional[Trajectory] = None
+    is_rarm: Optional[bool] = None
+    base_path_final: Optional[Trajectory] = None
+    base_path_to_post_remove_chair: Optional[Trajectory] = None
+    base_path_to_pre_remove_chair: Optional[Trajectory] = None
+
+
 class TaskPlanner:
     sampler: SituationSampler
     chair_manager: ChairManager
@@ -194,8 +205,7 @@ class TaskPlanner:
                 self.table,
                 create_map_from_obstacle_param(obstacles_param),
             )
-            rplanner.plan(chairs_param)
-            assert False
+            return rplanner.plan(chairs_param)
 
         # finally
         table_mat = create_map_from_obstacle_param(obstacles_param)
@@ -219,8 +229,7 @@ class TaskPlanner:
                 self.table,
                 table_mat,
             )
-            rplanner.plan(chairs_param)
-            assert False
+            return rplanner.plan(chairs_param)
 
         print("now the phase of finding feasible solution by actually solving the problem")
         for pose, is_feasible, min_idx in zip(recahable_pr2_poses, is_feasibiles, min_indices):
@@ -326,7 +335,7 @@ class RepairPlanner:
         coll_cst_with_chair = spec.create_collision_const(attachements=(aspec,))
         self.collision_cst_with_chair = coll_cst_with_chair
 
-    def plan(self, chairs_param_original: np.ndarray) -> int:
+    def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
             chair_pose_remove = chairs_param_original[i_chair * 3 : (i_chair + 1) * 3]
@@ -337,6 +346,8 @@ class RepairPlanner:
             sdf = self.chair_manager.create_sdf()
             sdf.merge(self.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf)
+
+            planning_result = PlanningResult()
 
             # first check if the robot base can reach the goal
             tree = MultiGoalRRT(
@@ -360,11 +371,14 @@ class RepairPlanner:
                 continue
 
             # check if i_chair can be graspable
-            chair_remove_start_pr2_pose = self.determine_pregrasp_chair_pr2_base_pose(
+            pre_remove_pr2_pose = self.determine_pregrasp_chair_pr2_base_pose(
                 chair_pose_remove, tree
             )
-            if chair_remove_start_pr2_pose is None:
+            if pre_remove_pr2_pose is None:
                 continue
+            planning_result.base_path_to_pre_remove_chair = Trajectory(
+                tree.get_solution(pre_remove_pr2_pose).T
+            )
 
             # check if the detected situation is feasible by actually solving the problem
             feasible_pr2_final_pose = None
@@ -383,22 +397,19 @@ class RepairPlanner:
                 if res.traj is None:
                     continue
                 feasible_pr2_final_pose = pr2_final_pose
+                planning_result.joint_path_final = res.traj
+                planning_result.is_rarm = reaching_task.is_using_rarm()
                 break
             if feasible_pr2_final_pose is None:
                 continue
-            print("ok")
 
-            # NOTE: At this stage, we are almost sure that the problem is solvable
-            # Next thing to do is just determine where to place the chair (and is bit complicated)
-
-            # TODO: generate path assuming that chair is removed
+            # check if feasible placment of the chair is possible
             path = tree.get_solution(feasible_pr2_final_pose).T
             traj = Trajectory(path).resample(100)
 
-            # TODO: determine nearest node that is collision free from th path and problem is feasible
             self.collision_cst_with_chair.set_sdf(sdf)
             tree_chair_attach = MultiGoalRRT(
-                chair_remove_start_pr2_pose,
+                pre_remove_pr2_pose,
                 self.pr2_pose_lb,
                 self.pr2_pose_ub,
                 self.collision_cst_with_chair,
@@ -407,12 +418,15 @@ class RepairPlanner:
             nodes = tree_chair_attach.get_debug_states()
             dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
             sorted_indices = np.argsort(dists)
+
+            valid_post_remove_pr2_pose = None
+            valid_post_remove_chair_pose = None
             for ind in sorted_indices:
-                post_removable_pr2_pose = nodes[ind]
-                chair_pose = post_removable_pr2_pose + np.array(
+                post_remove_pr2_pose = nodes[ind]
+                chair_pose = post_remove_pr2_pose + np.array(
                     [
-                        self.CHAIR_GRASP_BASE_OFFSET * np.cos(post_removable_pr2_pose[2]),
-                        self.CHAIR_GRASP_BASE_OFFSET * np.sin(post_removable_pr2_pose[2]),
+                        self.CHAIR_GRASP_BASE_OFFSET * np.cos(post_remove_pr2_pose[2]),
+                        self.CHAIR_GRASP_BASE_OFFSET * np.sin(post_remove_pr2_pose[2]),
                         0.0,
                     ]
                 )
@@ -424,61 +438,36 @@ class RepairPlanner:
                 )
                 if not is_collision_free:
                     continue
+                valid_post_remove_pr2_pose = post_remove_pr2_pose
+                valid_post_remove_chair_pose = chair_pose
+                break
+            if valid_post_remove_pr2_pose is None:
+                continue
+            planning_result.base_path_to_post_remove_chair = Trajectory(
+                tree_chair_attach.get_solution(valid_post_remove_pr2_pose).T
+            )
 
-                # >> debug
-                v = PyrenderViewer()
-                task = JskMessyTableTaskWithChair(
-                    self.obstacle_param,
-                    chairs_param_original,
-                    feasible_pr2_final_pose,
-                    self.final_gripper_pose,
-                )
-                task.visualize(v)
-                pr2 = PR2(use_tight_joint_limit=False)
-                pr2.angle_vector(AV_INIT)
-                pr2.newcoords(
-                    Coordinates(
-                        [post_removable_pr2_pose[0], post_removable_pr2_pose[1], 0.0],
-                        [post_removable_pr2_pose[2], 0.0, 0.0],
-                    )
-                )
+            # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
+            chairs_param_post_remove = np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
+            self.chair_manager.set_param(chairs_param_post_remove)
+            sdf_post_remove = self.chair_manager.create_sdf()
+            self.collision_cst_base_only.set_sdf(sdf_post_remove)
 
-                # set chair coords (ahead
-                chair = JskChair()
-                co = pr2.copy_worldcoords()
-                co.translate([self.CHAIR_GRASP_BASE_OFFSET, 0.0, 0.0])
-                chair.newcoords(co)
-                chair.visualize(v)
+            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+            problem = Problem(
+                post_remove_pr2_pose,
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                pr2_final_pose,
+                self.collision_cst_base_only,
+                None,
+                np.array([0.1, 0.1, 0.1]),
+            )
+            ret = solver.solve(problem)
+            planning_result.base_path_final = ret.traj
+            return planning_result
 
-                v.add(pr2)
-                v.show()
-
-                sol = tree_chair_attach.get_solution(post_removable_pr2_pose).T
-                traj0 = Trajectory(sol).resample(100)
-                spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-                for q in traj0:
-                    spec.set_skrobot_model_state(pr2, q)
-                    v.redraw()
-                    time.sleep(0.1)
-
-                for q in traj:
-                    spec.set_skrobot_model_state(pr2, q)
-                    v.redraw()
-                    time.sleep(0.1)
-
-                if reaching_task.is_using_rarm():
-                    spec = PR2RarmSpec()
-                else:
-                    spec = PR2LarmSpec()
-                for q in res.traj.resample(100):
-                    spec.set_skrobot_model_state(pr2, q)
-                    v.redraw()
-                    time.sleep(0.1)
-
-                time.sleep(1000)
-            # assert False
-
-        assert False
+        assert None
 
     def determine_pregrasp_chair_pr2_base_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT
@@ -515,20 +504,39 @@ if __name__ == "__main__":
     ts = time.time()
     plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
     print(f"Time: {time.time() - ts}")
-
-    if plan is not None:
-        spec = PR2RarmSpec() if plan.rarm else PR2LarmSpec()
-        v = PyrenderViewer()
-        task.visualize(v)
+    if plan is None:
+        print("No solution found")
+    elif isinstance(plan, PlanningResult):
         pr2 = PR2(use_tight_joint_limit=False)
         pr2.angle_vector(AV_INIT)
-        pr2.newcoords(
-            Coordinates([plan.pr2_pose[0], plan.pr2_pose[1], 0.0], [plan.pr2_pose[2], 0.0, 0.0])
-        )
+        pr2.newcoords(Coordinates([start[0], start[1], 0.0], [start[2], 0.0, 0.0]))
+        base_spec = PR2BaseOnlySpec()
+        base_spec.set_skrobot_model_state(pr2, plan.base_path_to_pre_remove_chair[0])
+        v = PyrenderViewer()
+        task.visualize(v)
         v.add(pr2)
         v.show()
         time.sleep(2)
-        for q in plan.traj:
+        for q in plan.base_path_to_pre_remove_chair.resample(100):
+            base_spec.set_skrobot_model_state(pr2, q)
+            v.redraw()
+            time.sleep(0.05)
+        input("Press Enter to continue...")
+
+        for q in plan.base_path_to_post_remove_chair.resample(100):
+            base_spec.set_skrobot_model_state(pr2, q)
+            v.redraw()
+            time.sleep(0.05)
+
+        input("Press Enter to continue...")
+        for q in plan.base_path_final:
+            base_spec.set_skrobot_model_state(pr2, q)
+            v.redraw()
+            time.sleep(0.05)
+
+        input("Press Enter to continue...")
+        spec = PR2RarmSpec() if plan.is_rarm else PR2LarmSpec()
+        for q in plan.joint_path_final.resample(100):
             spec.set_skrobot_model_state(pr2, q)
             v.redraw()
             time.sleep(0.05)
