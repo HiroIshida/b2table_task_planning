@@ -373,11 +373,11 @@ class RepairPlanner:
             ):
                 if not is_feasible:
                     continue
-                task = JskMessyTableTaskWithChair(
+                reaching_task = JskMessyTableTaskWithChair(
                     self.obstacle_param, chairs_param_hypo, pr2_final_pose, self.final_gripper_pose
                 )
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
-                solver.setup(task.export_problem())
+                solver.setup(reaching_task.export_problem())
                 init_traj = self.engine.lib.init_solutions[min_idx]
                 res = solver.solve(init_traj)
                 if res.traj is None:
@@ -388,8 +388,14 @@ class RepairPlanner:
                 continue
             print("ok")
 
-            # NOTE: In this stage, we are almost sure that the problem is solvable
+            # NOTE: At this stage, we are almost sure that the problem is solvable
             # Next thing to do is just determine where to place the chair (and is bit complicated)
+
+            # TODO: generate path assuming that chair is removed
+            path = tree.get_solution(feasible_pr2_final_pose).T
+            traj = Trajectory(path).resample(100)
+
+            # TODO: determine nearest node that is collision free from th path and problem is feasible
             self.collision_cst_with_chair.set_sdf(sdf)
             tree_chair_attach = MultiGoalRRT(
                 chair_remove_start_pr2_pose,
@@ -398,7 +404,80 @@ class RepairPlanner:
                 self.collision_cst_with_chair,
                 1000,
             )
-            return
+            nodes = tree_chair_attach.get_debug_states()
+            dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
+            sorted_indices = np.argsort(dists)
+            for ind in sorted_indices:
+                post_removable_pr2_pose = nodes[ind]
+                chair_pose = post_removable_pr2_pose + np.array(
+                    [
+                        self.CHAIR_GRASP_BASE_OFFSET * np.cos(post_removable_pr2_pose[2]),
+                        self.CHAIR_GRASP_BASE_OFFSET * np.sin(post_removable_pr2_pose[2]),
+                        0.0,
+                    ]
+                )
+                self.chair_manager.set_param(chair_pose)
+                sdf = self.chair_manager.create_sdf()
+                self.collision_cst_base_only.set_sdf(sdf)
+                is_collision_free = np.all(
+                    [self.collision_cst_base_only.is_valid(q) for q in traj.numpy()]
+                )
+                if not is_collision_free:
+                    continue
+
+                # >> debug
+                v = PyrenderViewer()
+                task = JskMessyTableTaskWithChair(
+                    self.obstacle_param,
+                    chairs_param_original,
+                    feasible_pr2_final_pose,
+                    self.final_gripper_pose,
+                )
+                task.visualize(v)
+                pr2 = PR2(use_tight_joint_limit=False)
+                pr2.angle_vector(AV_INIT)
+                pr2.newcoords(
+                    Coordinates(
+                        [post_removable_pr2_pose[0], post_removable_pr2_pose[1], 0.0],
+                        [post_removable_pr2_pose[2], 0.0, 0.0],
+                    )
+                )
+
+                # set chair coords (ahead
+                chair = JskChair()
+                co = pr2.copy_worldcoords()
+                co.translate([self.CHAIR_GRASP_BASE_OFFSET, 0.0, 0.0])
+                chair.newcoords(co)
+                chair.visualize(v)
+
+                v.add(pr2)
+                v.show()
+
+                sol = tree_chair_attach.get_solution(post_removable_pr2_pose).T
+                traj0 = Trajectory(sol).resample(100)
+                spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+                for q in traj0:
+                    spec.set_skrobot_model_state(pr2, q)
+                    v.redraw()
+                    time.sleep(0.1)
+
+                for q in traj:
+                    spec.set_skrobot_model_state(pr2, q)
+                    v.redraw()
+                    time.sleep(0.1)
+
+                if reaching_task.is_using_rarm():
+                    spec = PR2RarmSpec()
+                else:
+                    spec = PR2LarmSpec()
+                for q in res.traj.resample(100):
+                    spec.set_skrobot_model_state(pr2, q)
+                    v.redraw()
+                    time.sleep(0.1)
+
+                time.sleep(1000)
+            # assert False
+
         assert False
 
     def determine_pregrasp_chair_pr2_base_pose(
