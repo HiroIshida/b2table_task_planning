@@ -207,6 +207,7 @@ class TaskPlanner:
                 pr2_pose_now,
                 reaching_pose,
                 pr2_pose_cands,
+                obstacles_param,
                 create_map_from_obstacle_param(obstacles_param),
             )
             assert False
@@ -221,7 +222,9 @@ class TaskPlanner:
 
         # check if any feasible solution exists
         if not np.any(is_feasibiles):
-            self._determine_remove_chairs(pr2_pose_now, reaching_pose, pr2_pose_cands, table_mat)
+            self._determine_remove_chairs(
+                pr2_pose_now, reaching_pose, pr2_pose_cands, obstacles_param, table_mat
+            )
             assert False
 
         print("now the phase of finding feasible solution by actually solving the problem")
@@ -273,6 +276,7 @@ class TaskPlanner:
         current_pose: np.ndarray,
         reaching_pose: np.ndarray,
         pose_list: np.ndarray,
+        obstacles_param: np.ndarray,
         table_mat: np.ndarray,
     ) -> np.ndarray:
         assert len(pose_list) > 0
@@ -287,22 +291,23 @@ class TaskPlanner:
             chairs_param = original_chairs_param.copy().reshape(-1, 3)
             chairs_param = np.delete(chairs_param, i_chair, axis=0)
             chairs_param = chairs_param.flatten()
+            print(f"chair_param: {chairs_param}")
 
-            # >> dup
             self.chair_manager.set_param(chairs_param)
-            cst.set_sdf(self.chair_manager.create_sdf())
+            sdf = self.chair_manager.create_sdf()
+            sdf.merge(self.table.create_sdf())
+            cst.set_sdf(sdf)
+
             tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 500)
             bools = tree.is_reachable_batch(pose_list.T, 0.5)
             reachable_poses = pose_list[bools]
-            if len(pose_list) == 0:
+            if len(reachable_poses) == 0:
                 continue
             print(f"find reachable poses after removing chair {i_chair}")
             ground_mat = create_map_from_chair_param(chairs_param)
             reaching_pose_tile = np.tile(reaching_pose, (reachable_poses.shape[0], 1))
             vectors = np.concatenate([reachable_poses, reaching_pose_tile], axis=1)
             is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
-            # << dup
-            reachable_poses[is_feasibiles]
 
             if not np.any(is_feasibiles):
                 continue
@@ -311,8 +316,57 @@ class TaskPlanner:
             pre_grasp_base_pose = self._determine_pregrasp_chair_pr2_base_pose(
                 blocking_chair_pose, tree
             )
-            if pre_grasp_base_pose is None:
+
+            # Now among the many pr2_final_pose we find the one that is actually feasible
+            # if the chair is removed
+            selected_pr2_final_pose = None
+            for pr2_final_pose, is_feasible, min_idx in zip(
+                reachable_poses, is_feasibiles, min_indices
+            ):
+                if not is_feasible:
+                    continue
+                task = JskMessyTableTaskWithChair(
+                    obstacles_param, chairs_param, pr2_final_pose, reaching_pose
+                )
+                solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
+                solver.setup(task.export_problem())
+                init_traj = self.engine.lib.init_solutions[min_idx]
+                res = solver.solve(init_traj)
+                if res.traj is None:
+                    continue
+                selected_pr2_final_pose = pr2_final_pose
+                break
+            if selected_pr2_final_pose is None:
                 continue
+
+            # OK. now assuming that the chair is removed, we make a plan from current pose to the selected final pose
+            # Actually MultiGoalRRT already has the information of the path from current pose to the selected final pose
+            # So we just retrieve the path.
+            assert tree.is_reachable(selected_pr2_final_pose, 0.5)
+            solution = tree.get_solution(selected_pr2_final_pose).T
+
+            # generate randomized pose of the blocking chair and see if any of them does not block the path
+            # generate 30 random poses and sort it in the order of the distance from the original pose
+            rand_lb = np.array([-1.0, -1.0, -0.5 * np.pi])
+            rand_ub = np.array([1.0, 1.0, 0.5 * np.pi])
+            N_random_move = 30
+            rands = np.random.uniform(rand_lb, rand_ub, (N_random_move, 3))
+            dists = np.linalg.norm(rands - blocking_chair_pose, axis=1)
+            sorted_indices = np.argsort(dists)
+            print(f"sorted_indices: {rands[sorted_indices]}")
+            for i in sorted_indices:
+                blocking_chair_pose_rand = blocking_chair_pose + rands[i]
+                # NOTE: because we know that solution does not collide with other chairs,
+                # so we only care about the collision with the blocking chair
+                self.chair_manager.set_param(blocking_chair_pose_rand)
+                sdf = self.chair_manager.create_sdf()
+                cst.set_sdf(sdf)
+
+                dont_blocking = np.all([cst.is_valid(q) for q in solution])
+                if dont_blocking:
+                    print("found a solution")
+                    return
+                print("failure!")
 
         assert False, "planning failed"
 
