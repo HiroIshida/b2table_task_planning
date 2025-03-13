@@ -11,7 +11,12 @@ from hifuku.script_utils import load_library
 from plainmp.constraint import SphereCollisionCst
 from plainmp.experimental import MultiGoalRRT
 from plainmp.psdf import UnionSDF
-from plainmp.robot_spec import PR2BaseOnlySpec, PR2LarmSpec, PR2RarmSpec
+from plainmp.robot_spec import (
+    PR2BaseOnlySpec,
+    PR2LarmSpec,
+    PR2RarmSpec,
+    SphereAttachmentSpec,
+)
 from plainmp.trajectory import Trajectory
 from rpbench.articulated.pr2.thesis_jsk_table import (
     AV_INIT,
@@ -155,6 +160,7 @@ class TaskPlanner:
         target_region, _ = JskMessyTableTaskWithChair._prepare_target_region()
         region_lb = target_region.worldpos() - 0.5 * target_region.extents
         region_ub = target_region.worldpos() + 0.5 * target_region.extents
+        region_ub[1] += 0.6
         self.pr2_pose_lb = np.hstack([region_lb[:2], [-np.pi * 1.5]])
         self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
 
@@ -273,6 +279,8 @@ class RepairPlanner:
     table: JskTable
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
     collision_cst_base_only: SphereCollisionCst
+    collision_cst_with_chair: SphereCollisionCst
+    CHAIR_GRASP_BASE_OFFSET = 0.8
 
     def __init__(
         self,
@@ -298,15 +306,25 @@ class RepairPlanner:
         self.table = table
         self.table_mat = table_mat
 
-        # prepare collision constraint
         spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+
+        # prepare collision constraint
         skmodel = spec.get_robot_model(deepcopy=False)
         skmodel.angle_vector(AV_INIT)
         spec.reflect_skrobot_model_to_kin(skmodel)
         self.collision_cst_base_only = spec.create_collision_const()
 
         # prepare chair-attached collision constraint
-        # TODDO
+        chair_bbox_lb = np.array([-JskChair.DEPTH * 0.5, -JskChair.WIDTH * 0.5, 0.0])
+        chair_bbox_ub = np.array([JskChair.DEPTH * 0.5, JskChair.WIDTH * 0.5, JskChair.BACK_HEIGHT])
+        x = np.linspace(chair_bbox_lb[0], chair_bbox_ub[0], 5) + self.CHAIR_GRASP_BASE_OFFSET
+        y = np.linspace(chair_bbox_lb[1], chair_bbox_ub[1], 5)
+        z = np.linspace(chair_bbox_lb[2], chair_bbox_ub[2], 10)
+        xx, yy, zz = np.meshgrid(x, y, z)
+        cloud = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
+        aspec = SphereAttachmentSpec("base_footprint", cloud.T, np.ones(len(cloud)) * 0.03, False)
+        coll_cst_with_chair = spec.create_collision_const(attachements=(aspec,))
+        self.collision_cst_with_chair = coll_cst_with_chair
 
     def plan(self, chairs_param_original: np.ndarray) -> int:
         n_chair = len(chairs_param_original) // 3
@@ -326,12 +344,11 @@ class RepairPlanner:
                 self.pr2_pose_lb,
                 self.pr2_pose_ub,
                 self.collision_cst_base_only,
-                500,
+                1000,
             )
             bools = tree.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
             reachable_poses = self.final_pr2_pose_cands[bools]
             if len(reachable_poses) == 0:
-                print("no reachable poses")
                 continue
 
             # check if the robot arm can reach the goal pose
@@ -340,7 +357,6 @@ class RepairPlanner:
             vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
             is_feasibiles, min_indices = self.engine.infer(vectors, self.table_mat, ground_mat)
             if not np.any(is_feasibiles):
-                print("no feasible poses")
                 continue
 
             # check if i_chair can be graspable
@@ -348,7 +364,6 @@ class RepairPlanner:
                 chair_pose_remove, tree
             )
             if chair_remove_start_pr2_pose is None:
-                print("no feasible pregrasp pose")
                 continue
 
             # check if the detected situation is feasible by actually solving the problem
@@ -370,18 +385,24 @@ class RepairPlanner:
                 feasible_pr2_final_pose = pr2_final_pose
                 break
             if feasible_pr2_final_pose is None:
-                print("no feasible final pose")
                 continue
+            print("ok")
 
             # NOTE: In this stage, we are almost sure that the problem is solvable
             # Next thing to do is just determine where to place the chair (and is bit complicated)
-            print("success")
+            self.collision_cst_with_chair.set_sdf(sdf)
+            tree_chair_attach = MultiGoalRRT(
+                chair_remove_start_pr2_pose,
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                self.collision_cst_with_chair,
+                1000,
+            )
             return
         assert False
 
-    @staticmethod
     def determine_pregrasp_chair_pr2_base_pose(
-        chair_pose: np.ndarray, tree: MultiGoalRRT
+        self, chair_pose: np.ndarray, tree: MultiGoalRRT
     ) -> Optional[np.ndarray]:
         # check if blocking chair is actually removable by
         # hypothetically chaing the chair yaw angles
@@ -392,17 +413,16 @@ class RepairPlanner:
         sins = np.sin(yaw_cands)
         coss = np.cos(yaw_cands)
 
-        positional_offset = 0.8
-        xs = x - positional_offset * coss
-        ys = y - positional_offset * sins
+        xs = x - self.CHAIR_GRASP_BASE_OFFSET * coss
+        ys = y - self.CHAIR_GRASP_BASE_OFFSET * sins
         pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
         bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
         if not np.any(bools):
             return None
 
         min_yaw = yaw_cands[bools].min()
-        x = x - positional_offset * np.cos(min_yaw)
-        y = y - positional_offset * np.sin(min_yaw)
+        x = x - self.CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
+        y = y - self.CHAIR_GRASP_BASE_OFFSET * np.sin(min_yaw)
         pre_grasp_base_pose = np.array([x, y, min_yaw])
         return pre_grasp_base_pose
 
