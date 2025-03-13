@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -190,7 +190,9 @@ class TaskPlanner:
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
-        recahable_pr2_poses = self._select_reachable_poses(pr2_pose_now, pr2_pose_cands)
+        recahable_pr2_poses, current_tree = self._select_reachable_poses(
+            pr2_pose_now, pr2_pose_cands
+        )
 
         if recahable_pr2_poses is None:
             rplanner = RepairPlanner(
@@ -204,6 +206,7 @@ class TaskPlanner:
                 obstacles_param,
                 self.table,
                 create_map_from_obstacle_param(obstacles_param),
+                current_tree,
             )
             return rplanner.plan(chairs_param)
 
@@ -228,6 +231,7 @@ class TaskPlanner:
                 obstacles_param,
                 self.table,
                 table_mat,
+                current_tree,
             )
             return rplanner.plan(chairs_param)
 
@@ -259,8 +263,9 @@ class TaskPlanner:
 
     def _select_reachable_poses(
         self, current_pose: np.ndarray, pose_list: np.ndarray
-    ) -> Optional[np.ndarray]:
-        # check if robot is placable at the sampled pose
+    ) -> Tuple[Optional[np.ndarray], MultiGoalRRT]:
+        # check if robot is placable at the sampled pose.
+        # Also, return the tree as a bi-product
         sdf = self.chair_manager.create_sdf()
         sdf.merge(self.table.create_sdf())
 
@@ -273,7 +278,7 @@ class TaskPlanner:
 
         tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 1000)
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
-        return pose_list[bools]
+        return pose_list[bools], tree
 
 
 class RepairPlanner:
@@ -287,6 +292,7 @@ class RepairPlanner:
     obstacle_param: np.ndarray
     table: JskTable
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
+    tree_current: MultiGoalRRT
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
     CHAIR_GRASP_BASE_OFFSET = 0.8
@@ -303,6 +309,7 @@ class RepairPlanner:
         obstacle_param: np.ndarray,
         table: JskTable,
         table_mat: np.ndarray,
+        tree_current: MultiGoalRRT,
     ):
         self.init_pr2_pose = init_pr2_pose
         self.final_pr2_pose_cands = final_pr2_pose_cands
@@ -314,6 +321,7 @@ class RepairPlanner:
         self.obstacle_param = obstacle_param
         self.table = table
         self.table_mat = table_mat
+        self.tree_current = tree_current
 
         spec = PR2BaseOnlySpec(use_fixed_uuid=True)
 
@@ -350,14 +358,14 @@ class RepairPlanner:
             planning_result = PlanningResult()
 
             # first check if the robot base can reach the goal
-            tree = MultiGoalRRT(
+            tree_completely_removed = MultiGoalRRT(
                 self.init_pr2_pose,
                 self.pr2_pose_lb,
                 self.pr2_pose_ub,
                 self.collision_cst_base_only,
                 1000,
             )
-            bools = tree.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
+            bools = tree_completely_removed.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
             reachable_poses = self.final_pr2_pose_cands[bools]
             if len(reachable_poses) == 0:
                 continue
@@ -372,12 +380,12 @@ class RepairPlanner:
 
             # check if i_chair can be graspable
             pre_remove_pr2_pose = self.determine_pregrasp_chair_pr2_base_pose(
-                chair_pose_remove, tree
+                chair_pose_remove, self.tree_current
             )
             if pre_remove_pr2_pose is None:
                 continue
             planning_result.base_path_to_pre_remove_chair = Trajectory(
-                tree.get_solution(pre_remove_pr2_pose).T
+                self.tree_current.get_solution(pre_remove_pr2_pose).T
             )
 
             # check if the detected situation is feasible by actually solving the problem
@@ -404,7 +412,7 @@ class RepairPlanner:
                 continue
 
             # check if feasible placment of the chair is possible
-            path = tree.get_solution(feasible_pr2_final_pose).T
+            path = tree_completely_removed.get_solution(feasible_pr2_final_pose).T
             traj = Trajectory(path).resample(100)
 
             self.collision_cst_with_chair.set_sdf(sdf)
@@ -451,6 +459,7 @@ class RepairPlanner:
             chairs_param_post_remove = np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
             self.chair_manager.set_param(chairs_param_post_remove)
             sdf_post_remove = self.chair_manager.create_sdf()
+            sdf_post_remove.merge(self.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf_post_remove)
 
             solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
