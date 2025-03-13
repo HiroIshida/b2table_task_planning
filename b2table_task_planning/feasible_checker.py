@@ -302,37 +302,45 @@ class TaskPlanner:
             vectors = np.concatenate([reachable_poses, reaching_pose_tile], axis=1)
             is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
             # << dup
+            reachable_poses[is_feasibiles]
 
-            if np.any(is_feasibiles):
-                # check if blocking chair is actually removable by
-                # hypothetically chaing the chair yaw angles
-                # assuming that PR2 can rotate the chair by 90 degrees
-                x, y, yaw = original_chairs_param[i_chair * 3 : (i_chair + 1) * 3]
-                yaw_rotates = np.linspace(-np.pi * 0.5, np.pi * 0.5, 10)
-                yaw_cands = yaw + yaw_rotates
-                sins = np.sin(yaw_cands)
-                coss = np.cos(yaw_cands)
+            if not np.any(is_feasibiles):
+                continue
 
-                positional_offset = 0.8
-                xs = x - positional_offset * coss
-                ys = y - positional_offset * sins
-                pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
-                bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
-
-                if np.any(bools):
-                    # TODO: maybe we need to actually solve the planning problem to avoid
-                    # rework/setbac, though at this stage, we are almost sure that the repair action is feasible
-
-                    min_yaw = yaw_cands[bools].min()
-                    x = x - positional_offset * np.cos(min_yaw)
-                    y = y - positional_offset * np.sin(min_yaw)
-                    np.array([x, y, min_yaw])
-
-                    # solve the base planning problem removing the chair and store the path
-
-                    # Then determine where to place the chair (near to the current position as possible but not blocking the path)
+            blocking_chair_pose = original_chairs_param[i_chair * 3 : (i_chair + 1) * 3]
+            pre_grasp_base_pose = self._determine_pregrasp_chair_pr2_base_pose(
+                blocking_chair_pose, tree
+            )
+            if pre_grasp_base_pose is None:
+                continue
 
         assert False, "planning failed"
+
+    def _determine_pregrasp_chair_pr2_base_pose(
+        self, chair_pose: np.ndarray, tree: MultiGoalRRT
+    ) -> Optional[np.ndarray]:
+        # check if blocking chair is actually removable by
+        # hypothetically chaing the chair yaw angles
+        # assuming that PR2 can rotate the chair by 90 degrees
+        x, y, yaw = chair_pose
+        yaw_rotates = np.linspace(-np.pi * 0.5, np.pi * 0.5, 10)
+        yaw_cands = yaw + yaw_rotates
+        sins = np.sin(yaw_cands)
+        coss = np.cos(yaw_cands)
+
+        positional_offset = 0.8
+        xs = x - positional_offset * coss
+        ys = y - positional_offset * sins
+        pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
+        bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
+        if not np.any(bools):
+            return None
+
+        min_yaw = yaw_cands[bools].min()
+        x = x - positional_offset * np.cos(min_yaw)
+        y = y - positional_offset * np.sin(min_yaw)
+        pre_grasp_base_pose = np.array([x, y, min_yaw])
+        return pre_grasp_base_pose
 
 
 if __name__ == "__main__":
