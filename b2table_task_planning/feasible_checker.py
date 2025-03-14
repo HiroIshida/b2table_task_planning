@@ -528,6 +528,48 @@ class RepairPlanner:
             )
             ret = solver.solve(problem)
             planning_result.base_path_final = ret.traj
+
+            # optionally? smooth result of the base_path_to_pre_remove_chair
+            self.collision_cst_base_only.set_sdf(sdf_hypo)
+            self.chair_manager.set_param(chairs_param_original)
+            sdf_original = self.chair_manager.create_sdf()
+            sdf_original.merge(self.table.create_sdf())
+            self.collision_cst_base_only.set_sdf(sdf_original)
+            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+
+            problem = Problem(
+                planning_result.base_path_to_pre_remove_chair[0],
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                planning_result.base_path_to_pre_remove_chair[-1],
+                self.collision_cst_base_only,
+                None,
+                np.array([0.1, 0.1, 0.1]),
+            )
+            ret = solver.solve(problem)
+            assert ret.traj is not None, "this should not happen"
+            planning_result.base_path_to_pre_remove_chair = ret.traj
+
+            # optionally? smooth result of the base_path_to_post_remove_chair
+            self.collision_cst_with_chair.set_sdf(sdf_hypo)
+            pr2_model.angle_vector(AV_CHAIR_GRASP)
+            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
+
+            # for q in planning_result.base_path_to_post_remove_chair:
+            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+            problem = Problem(
+                planning_result.base_path_to_post_remove_chair[0],
+                self.pr2_pose_lb,
+                self.pr2_pose_ub,
+                planning_result.base_path_to_post_remove_chair[-1],
+                self.collision_cst_with_chair,
+                None,
+                np.array([0.1, 0.1, 0.1]),
+            )
+            ret = solver.solve(problem)
+            assert ret.traj is not None, "this should not happen"
+            planning_result.base_path_to_post_remove_chair = ret.traj
+
             return planning_result
         print("tried to repair the environment but failed")
         return None
