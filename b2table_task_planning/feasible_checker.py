@@ -181,7 +181,7 @@ class TaskPlanner:
         target_region, _ = JskMessyTableTaskWithChair._prepare_target_region()
         region_lb = target_region.worldpos() - 0.5 * target_region.extents
         region_ub = target_region.worldpos() + 0.5 * target_region.extents
-        region_ub[1] += 0.6
+        region_ub[1] += 1.0
         self.pr2_pose_lb = np.hstack([region_lb[:2], [-np.pi * 1.5]])
         self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
 
@@ -192,6 +192,13 @@ class TaskPlanner:
         obstacles_param: np.ndarray,
         chairs_param: np.ndarray,
     ) -> Optional[PlanningResult]:
+
+        # check if pr2_pose_now is inside lb and ub
+        if not np.all(pr2_pose_now[:2] > self.pr2_pose_lb[:2]) or not np.all(
+            pr2_pose_now[:2] < self.pr2_pose_ub[:2]
+        ):
+            print("pr2_pose_now is out of the bound")
+            return None
 
         # here we assume that only chair is movable
         self.sampler.register_tabletop_obstacles(obstacles_param)
