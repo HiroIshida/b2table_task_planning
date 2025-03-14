@@ -41,6 +41,8 @@ from b2table_task_planning.scenario import need_fix_task
 AV_CHAIR_GRASP = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.87266463, 0.0, -0.44595566, -0.07283169, -2.2242064, 4.9038143, -1.4365499, -0.93810624, -0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.44595566, -0.07283169, 2.2242064, -4.9038143, -1.4365499, -0.93810624, 0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 # fmt: on
 
+CHAIR_GRASP_BASE_OFFSET = 0.8
+
 
 def create_map_from_obstacle_param(obstacles_param: np.ndarray):
     obstacle_env_region = BoxSkeleton(
@@ -306,6 +308,33 @@ class TaskPlanner:
         return pose_list[bools], tree
 
 
+def setup_spec_and_coll_cst():
+    base_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+
+    # prepare collision constraint
+    skmodel = base_spec.get_robot_model(deepcopy=False)
+    skmodel.angle_vector(AV_INIT)
+    base_spec.reflect_skrobot_model_to_kin(skmodel)
+    collision_cst_base_only = base_spec.create_collision_const()
+
+    # prepare chair-attached collision constraint
+    chair_bbox_lb = np.array([-JskChair.DEPTH * 0.5, -JskChair.WIDTH * 0.5, 0.0])
+    chair_bbox_ub = np.array([JskChair.DEPTH * 0.5, JskChair.WIDTH * 0.5, JskChair.BACK_HEIGHT])
+    x = np.linspace(chair_bbox_lb[0], chair_bbox_ub[0], 10)
+    y = np.linspace(chair_bbox_lb[1], chair_bbox_ub[1], 10)
+    z = np.linspace(chair_bbox_lb[2], chair_bbox_ub[2], 20)
+    xx, yy, zz = np.meshgrid(x, y, z)
+    cloud = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
+    cloud[:, 0] += CHAIR_GRASP_BASE_OFFSET
+    aspec = SphereAttachmentSpec("base_footprint", cloud.T, np.ones(len(cloud)) * 0.05, False)
+    coll_cst_with_chair = base_spec.create_collision_const(attachements=(aspec,))
+    collision_cst_with_chair = coll_cst_with_chair
+    return base_spec, collision_cst_base_only, collision_cst_with_chair
+
+
+_BASE_SPEC, _COLLISION_CST_BASE_ONLY, _COLLISION_CST_WITH_CHAIR = setup_spec_and_coll_cst()
+
+
 class RepairPlanner:
     init_pr2_pose: np.ndarray
     final_pr2_pose_cands: np.ndarray
@@ -321,7 +350,6 @@ class RepairPlanner:
     base_spec: PR2BaseOnlySpec
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
-    CHAIR_GRASP_BASE_OFFSET = 0.8
 
     def __init__(
         self,
@@ -349,27 +377,10 @@ class RepairPlanner:
         self.table_mat = table_mat
         self.tree_current = tree_current
 
-        spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-        self.base_spec = spec
-
-        # prepare collision constraint
-        skmodel = spec.get_robot_model(deepcopy=False)
-        skmodel.angle_vector(AV_INIT)
-        spec.reflect_skrobot_model_to_kin(skmodel)
-        self.collision_cst_base_only = spec.create_collision_const()
-
-        # prepare chair-attached collision constraint
-        chair_bbox_lb = np.array([-JskChair.DEPTH * 0.5, -JskChair.WIDTH * 0.5, 0.0])
-        chair_bbox_ub = np.array([JskChair.DEPTH * 0.5, JskChair.WIDTH * 0.5, JskChair.BACK_HEIGHT])
-        x = np.linspace(chair_bbox_lb[0], chair_bbox_ub[0], 10)
-        y = np.linspace(chair_bbox_lb[1], chair_bbox_ub[1], 10)
-        z = np.linspace(chair_bbox_lb[2], chair_bbox_ub[2], 20)
-        xx, yy, zz = np.meshgrid(x, y, z)
-        cloud = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
-        cloud[:, 0] += self.CHAIR_GRASP_BASE_OFFSET
-        aspec = SphereAttachmentSpec("base_footprint", cloud.T, np.ones(len(cloud)) * 0.05, False)
-        coll_cst_with_chair = spec.create_collision_const(attachements=(aspec,))
-        self.collision_cst_with_chair = coll_cst_with_chair
+        # do this because creating the spec and collision constraint is expensive
+        self.base_spec = _BASE_SPEC
+        self.collision_cst_base_only = _COLLISION_CST_BASE_ONLY
+        self.collision_cst_with_chair = _COLLISION_CST_WITH_CHAIR
 
     def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
         n_chair = len(chairs_param_original) // 3
@@ -483,8 +494,8 @@ class RepairPlanner:
 
                 chair_pose = post_remove_pr2_pose + np.array(
                     [
-                        self.CHAIR_GRASP_BASE_OFFSET * np.cos(post_remove_pr2_pose[2]),
-                        self.CHAIR_GRASP_BASE_OFFSET * np.sin(post_remove_pr2_pose[2]),
+                        CHAIR_GRASP_BASE_OFFSET * np.cos(post_remove_pr2_pose[2]),
+                        CHAIR_GRASP_BASE_OFFSET * np.sin(post_remove_pr2_pose[2]),
                         0.0,
                     ]
                 )
@@ -586,16 +597,16 @@ class RepairPlanner:
         sins = np.sin(yaw_cands)
         coss = np.cos(yaw_cands)
 
-        xs = x - self.CHAIR_GRASP_BASE_OFFSET * coss
-        ys = y - self.CHAIR_GRASP_BASE_OFFSET * sins
+        xs = x - CHAIR_GRASP_BASE_OFFSET * coss
+        ys = y - CHAIR_GRASP_BASE_OFFSET * sins
         pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
         bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
         if not np.any(bools):
             return None
 
         min_yaw = yaw_cands[bools].min()
-        x = x - self.CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
-        y = y - self.CHAIR_GRASP_BASE_OFFSET * np.sin(min_yaw)
+        x = x - CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
+        y = y - CHAIR_GRASP_BASE_OFFSET * np.sin(min_yaw)
         pre_grasp_base_pose = np.array([x, y, min_yaw])
         yaw_rotate = min_yaw - chair_pose[2]
         return pre_grasp_base_pose, yaw_rotate
