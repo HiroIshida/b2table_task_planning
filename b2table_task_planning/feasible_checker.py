@@ -150,6 +150,8 @@ class PlanningResult:
     base_path_final: Optional[Trajectory] = None
     base_path_to_post_remove_chair: Optional[Trajectory] = None
     base_path_to_pre_remove_chair: Optional[Trajectory] = None
+    remove_chair_idx: Optional[int] = None
+    chair_rotation_angle: Optional[float] = None
 
 
 class TaskPlanner:
@@ -356,6 +358,7 @@ class RepairPlanner:
             self.collision_cst_base_only.set_sdf(sdf)
 
             planning_result = PlanningResult()
+            planning_result.remove_chair_idx = i_chair
 
             # first check if the robot base can reach the goal
             tree_completely_removed = MultiGoalRRT(
@@ -379,14 +382,15 @@ class RepairPlanner:
                 continue
 
             # check if i_chair can be graspable
-            pre_remove_pr2_pose = self.determine_pregrasp_chair_pr2_base_pose(
-                chair_pose_remove, self.tree_current
-            )
-            if pre_remove_pr2_pose is None:
+            ret = self.determine_pregrasp_chair_pr2_base_pose(chair_pose_remove, self.tree_current)
+            if ret is None:
                 continue
+            pre_remove_pr2_pose, yaw_rot = ret
+
             planning_result.base_path_to_pre_remove_chair = Trajectory(
                 self.tree_current.get_solution(pre_remove_pr2_pose).T
             )
+            planning_result.chair_rotation_angle = yaw_rot
 
             # check if the detected situation is feasible by actually solving the problem
             feasible_pr2_final_pose = None
@@ -480,7 +484,7 @@ class RepairPlanner:
 
     def determine_pregrasp_chair_pr2_base_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Tuple[np.ndarray, float]]:
         # check if blocking chair is actually removable by
         # hypothetically chaing the chair yaw angles
         # assuming that PR2 can rotate the chair by 90 degrees
@@ -501,7 +505,59 @@ class RepairPlanner:
         x = x - self.CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
         y = y - self.CHAIR_GRASP_BASE_OFFSET * np.sin(min_yaw)
         pre_grasp_base_pose = np.array([x, y, min_yaw])
-        return pre_grasp_base_pose
+        yaw_rotate = min_yaw - chair_pose[2]
+        return pre_grasp_base_pose, yaw_rotate
+
+
+class SceneVisualizer:
+    def __init__(self, pr2_pose, chairs_param: np.ndarray):
+        self.table = JskTable()
+        self.chair_manager = ChairManager()
+        self.chair_manager.set_param(chairs_param)
+        self.pr2 = PR2(use_tight_joint_limit=False)
+        self.pr2.angle_vector(AV_INIT)
+        self.pr2.newcoords(Coordinates([pr2_pose[0], pr2_pose[1], 0.0], [pr2_pose[2], 0.0, 0.0]))
+        self.chair_handles_list = []
+        self.v = None
+
+    def visualize(self):
+        v = PyrenderViewer()
+        self.table.visualize(v)
+        for i_chair in range(self.chair_manager.n_chair):
+            chair = self.chair_manager.chairs[i_chair]
+            handles = chair.visualize(v)
+            self.chair_handles_list.append(handles)
+        v.add(self.pr2)
+        v.show()
+        self.v = v
+
+    def visualize_base_trajectory(self, traj: Trajectory):
+        assert self.v
+        spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        for q_base in traj.resample(100):
+            spec.set_skrobot_model_state(self.pr2, q_base)
+            self.v.redraw()
+            time.sleep(0.05)
+
+    def visualize_joint_trajectory(self, traj: Trajectory, is_rarm: bool):
+        assert self.v
+        spec = PR2RarmSpec() if is_rarm else PR2LarmSpec()
+        for q_joint in traj.resample(100):
+            spec.set_skrobot_model_state(self.pr2, q_joint)
+            self.v.redraw()
+            time.sleep(0.05)
+
+    def visualize_chair_rotation(self, chair_idx: int, chair_rotation_angle: float):
+        assert isinstance(self.v, PyrenderViewer)
+        vis_prim_handles = self.chair_handles_list[chair_idx]
+        for prim in vis_prim_handles:
+            self.v.delete(prim)
+        chair = self.chair_manager.chairs[chair_idx]
+        chair.rotate(chair_rotation_angle, "z")
+        chair_handles = chair.visualize(self.v)
+        self.chair_handles_list[chair_idx] = chair_handles
+        self.v.redraw()
+        time.sleep(0.05)
 
 
 if __name__ == "__main__":
@@ -512,41 +568,20 @@ if __name__ == "__main__":
     start = np.array([0.784, 2.57, -2.0])
     ts = time.time()
     plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
-    print(f"Time: {time.time() - ts}")
+    sv = SceneVisualizer(start, task.chairs_param)
+    sv.visualize()
+    time.sleep(2)
     if plan is None:
         print("No solution found")
     elif isinstance(plan, PlanningResult):
-        pr2 = PR2(use_tight_joint_limit=False)
-        pr2.angle_vector(AV_INIT)
-        pr2.newcoords(Coordinates([start[0], start[1], 0.0], [start[2], 0.0, 0.0]))
-        base_spec = PR2BaseOnlySpec()
-        base_spec.set_skrobot_model_state(pr2, plan.base_path_to_pre_remove_chair[0])
-        v = PyrenderViewer()
-        task.visualize(v)
-        v.add(pr2)
-        v.show()
-        time.sleep(2)
-        for q in plan.base_path_to_pre_remove_chair.resample(100):
-            base_spec.set_skrobot_model_state(pr2, q)
-            v.redraw()
-            time.sleep(0.05)
+        print("Solution found")
+        sv.visualize_base_trajectory(plan.base_path_to_pre_remove_chair)
         input("Press Enter to continue...")
-
-        for q in plan.base_path_to_post_remove_chair.resample(100):
-            base_spec.set_skrobot_model_state(pr2, q)
-            v.redraw()
-            time.sleep(0.05)
-
+        sv.visualize_chair_rotation(plan.remove_chair_idx, plan.chair_rotation_angle)
         input("Press Enter to continue...")
-        for q in plan.base_path_final:
-            base_spec.set_skrobot_model_state(pr2, q)
-            v.redraw()
-            time.sleep(0.05)
-
+        sv.visualize_base_trajectory(plan.base_path_to_post_remove_chair)
         input("Press Enter to continue...")
-        spec = PR2RarmSpec() if plan.is_rarm else PR2LarmSpec()
-        for q in plan.joint_path_final.resample(100):
-            spec.set_skrobot_model_state(pr2, q)
-            v.redraw()
-            time.sleep(0.05)
+        sv.visualize_base_trajectory(plan.base_path_final)
+        input("Press Enter to continue...")
+        sv.visualize_joint_trajectory(plan.joint_path_final, plan.is_rarm)
         time.sleep(1000)
