@@ -36,8 +36,6 @@ if __name__ == "__main__":
     ret = solve_ik(pose_cst, ineq_cst, lb, ub)
     assert ineq_cst.is_valid(ret.q)
     spec.set_skrobot_model_state(robot, ret.q)
-    av = robot.angle_vector()
-    print(list(av))
 
     lspec = PR2LarmSpec()
     q_left = ret.q.copy()
@@ -46,6 +44,9 @@ if __name__ == "__main__":
     q_left[4] *= -1
     q_left[6] *= -1
     lspec.set_skrobot_model_state(robot, q_left)
+
+    av = robot.angle_vector()
+    print(list(av))
 
     viewer = PyrenderViewer()
     viewer.add(robot)

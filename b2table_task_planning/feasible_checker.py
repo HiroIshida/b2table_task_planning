@@ -35,7 +35,11 @@ from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
 from b2table_task_planning.sampler import SituationSampler
-from b2table_task_planning.scenario import need_fix_task
+from b2table_task_planning.scenario import need_fix_task, barely_feasible_task
+
+# fmt: off
+AV_CHAIR_GRASP = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.87266463, 0.0, -0.44595566, -0.07283169, -2.2242064, 4.9038143, -1.4365499, -0.93810624, -0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.44595566, -0.07283169, 2.2242064, -4.9038143, -1.4365499, -0.93810624, 0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+# fmt: on
 
 
 def create_map_from_obstacle_param(obstacles_param: np.ndarray):
@@ -154,6 +158,9 @@ class PlanningResult:
     remove_chair_idx: Optional[int] = None
     chair_rotation_angle: Optional[float] = None
 
+    def require_repair(self) -> bool:
+        return self.base_path_to_pre_remove_chair is not None
+
 
 class TaskPlanner:
     sampler: SituationSampler
@@ -184,7 +191,7 @@ class TaskPlanner:
         reaching_pose: np.ndarray,
         obstacles_param: np.ndarray,
         chairs_param: np.ndarray,
-    ) -> Optional[TaskAndMotionPlan]:
+    ) -> Optional[PlanningResult]:
 
         # here we assume that only chair is movable
         self.sampler.register_tabletop_obstacles(obstacles_param)
@@ -249,9 +256,14 @@ class TaskPlanner:
                 init_traj = self.engine.lib.init_solutions[min_idx]
                 res = solver.solve(init_traj)
                 if res.traj is not None:
-                    return TaskAndMotionPlan(
-                        pr2_pose=pose, traj=res.traj, rarm=task.is_using_rarm()
-                    )
+                    result = PlanningResult()
+                    result.joint_path_final = res.traj
+                    result.is_rarm = task.is_using_rarm()
+                    result.base_path_final = Trajectory(current_tree.get_solution(pose).T)
+                    return result
+
+        assert False, "not supposed to reach here, but there is still very small chance to reach here..."
+
 
     def _sample_pr2_pose(self) -> Optional[np.ndarray]:
         pose_list = []
@@ -298,9 +310,10 @@ class RepairPlanner:
     table: JskTable
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
     tree_current: MultiGoalRRT
+    base_spec: PR2BaseOnlySpec
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
-    CHAIR_GRASP_BASE_OFFSET = 0.7
+    CHAIR_GRASP_BASE_OFFSET = 0.8
 
     def __init__(
         self,
@@ -329,6 +342,7 @@ class RepairPlanner:
         self.tree_current = tree_current
 
         spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        self.base_spec = spec
 
         # prepare collision constraint
         skmodel = spec.get_robot_model(deepcopy=False)
@@ -374,6 +388,7 @@ class RepairPlanner:
             bools = tree_completely_removed.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
             reachable_poses = self.final_pr2_pose_cands[bools]
             if len(reachable_poses) == 0:
+                print(f"giving up the chair {i_chair} because no feasible base pose found even after completely removing the chair")
                 continue
 
             # check if the robot arm can reach the goal pose
@@ -382,11 +397,13 @@ class RepairPlanner:
             vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
             is_feasibiles, min_indices = self.engine.infer(vectors, self.table_mat, ground_mat)
             if not np.any(is_feasibiles):
+                print(f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair")
                 continue
 
             # check if i_chair can be graspable
             ret = self.determine_pregrasp_chair_pr2_base_pose(chair_pose_remove, self.tree_current)
             if ret is None:
+                print(f"giving up the chair {i_chair} because grasping base pose is not reachable")
                 continue
             pre_remove_pr2_pose, yaw_rot = ret
 
@@ -416,6 +433,7 @@ class RepairPlanner:
                 planning_result.is_rarm = reaching_task.is_using_rarm()
                 break
             if feasible_pr2_final_pose is None:
+                print(f"giving up the chair {i_chair} because the arm planning is not 'actually' feasible even after completely removing the chair")
                 continue
 
             # check if feasible placment of the chair is possible
@@ -423,6 +441,9 @@ class RepairPlanner:
             traj = Trajectory(path).resample(100)
 
             self.collision_cst_with_chair.set_sdf(sdf)
+            pr2_model = self.base_spec.get_robot_model(deepcopy=False)
+            pr2_model.angle_vector(AV_CHAIR_GRASP)
+            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
             tree_chair_attach = MultiGoalRRT(
                 pre_remove_pr2_pose,
                 self.pr2_pose_lb,
@@ -430,6 +451,8 @@ class RepairPlanner:
                 self.collision_cst_with_chair,
                 1000,
             )
+            pr2_model.angle_vector(AV_INIT)
+            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)  # reset the kin model
             nodes = tree_chair_attach.get_debug_states()
             dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
             sorted_indices = np.argsort(dists)
@@ -457,6 +480,7 @@ class RepairPlanner:
                 valid_post_remove_chair_pose = chair_pose
                 break
             if valid_post_remove_pr2_pose is None:
+                print(f"giving up the chair {i_chair} because the chair placement is not feasible")
                 continue
             planning_result.base_path_to_post_remove_chair = Trajectory(
                 tree_chair_attach.get_solution(valid_post_remove_pr2_pose).T
@@ -482,8 +506,8 @@ class RepairPlanner:
             ret = solver.solve(problem)
             planning_result.base_path_final = ret.traj
             return planning_result
-
-        assert None
+        print("tried to repair the environment but failed")
+        return None
 
     def determine_pregrasp_chair_pr2_base_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT
@@ -546,6 +570,10 @@ class SceneVisualizer:
 
     def visualize_base_trajectory(self, traj: Trajectory, fix_chair_idx: Optional[int] = None):
         assert self.v
+
+        if fix_chair_idx is not None:
+            self.pr2.angle_vector(AV_CHAIR_GRASP)
+
         spec = PR2BaseOnlySpec(use_fixed_uuid=True)
         assoc = False
         for q_base in traj.resample(100):
@@ -560,6 +588,7 @@ class SceneVisualizer:
         if assoc:
             for prim in vis_prim_handles:
                 self.pr2.dissoc(prim)
+        self.pr2.angle_vector(AV_INIT)
 
     def visualize_joint_trajectory(self, traj: Trajectory, is_rarm: bool):
         assert self.v
@@ -583,26 +612,33 @@ class SceneVisualizer:
 
 
 if __name__ == "__main__":
-    # task = barely_feasible_task()
-    task = need_fix_task()
+    task = barely_feasible_task()
+    # task = need_fix_task()
     task_planner = TaskPlanner()
 
     start = np.array([0.784, 2.57, -2.0])
-    ts = time.time()
+    from pyinstrument import Profiler
+    profiler = Profiler()
+    profiler.start()
     plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
-    sv = SceneVisualizer(start, task.chairs_param)
+    profiler.stop()
+    print(profiler.output_text(unicode=True, color=True, show_all=False))
+    sv = SceneVisualizer(start, task.reaching_pose, task.chairs_param)
     sv.visualize()
     time.sleep(2)
     if plan is None:
         print("No solution found")
+        time.sleep(100)
     elif isinstance(plan, PlanningResult):
         print("Solution found")
-        sv.visualize_base_trajectory(plan.base_path_to_pre_remove_chair)
         input("Press Enter to continue...")
-        sv.visualize_chair_rotation(plan.remove_chair_idx, plan.chair_rotation_angle)
-        input("Press Enter to continue...")
-        sv.visualize_base_trajectory(plan.base_path_to_post_remove_chair, plan.remove_chair_idx)
-        input("Press Enter to continue...")
+        if plan.require_repair():
+            sv.visualize_base_trajectory(plan.base_path_to_pre_remove_chair)
+            input("Press Enter to continue...")
+            sv.visualize_chair_rotation(plan.remove_chair_idx, plan.chair_rotation_angle)
+            input("Press Enter to continue...")
+            sv.visualize_base_trajectory(plan.base_path_to_post_remove_chair, plan.remove_chair_idx)
+            input("Press Enter to continue...")
         sv.visualize_base_trajectory(plan.base_path_final)
         input("Press Enter to continue...")
         sv.visualize_joint_trajectory(plan.joint_path_final, plan.is_rarm)
