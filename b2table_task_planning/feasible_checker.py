@@ -281,6 +281,8 @@ class TaskPlanner:
 
         tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 1000)
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
+        if not np.any(bools):
+            return None, tree
         return pose_list[bools], tree
 
 
