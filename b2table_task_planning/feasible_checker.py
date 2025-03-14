@@ -1,3 +1,4 @@
+import copy
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -10,7 +11,7 @@ from hifuku.domain import Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
 from plainmp.constraint import SphereCollisionCst
 from plainmp.experimental import MultiGoalRRT
-from plainmp.ompl_solver import OMPLSolver, OMPLSolverConfig
+from plainmp.ompl_solver import OMPLSolver, OMPLSolverConfig, RefineType
 from plainmp.problem import Problem
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import (
@@ -35,7 +36,7 @@ from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
 from b2table_task_planning.sampler import SituationSampler
-from b2table_task_planning.scenario import need_fix_task
+from b2table_task_planning.scenario import barely_feasible_task
 
 # fmt: off
 AV_CHAIR_GRASP = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.87266463, 0.0, -0.44595566, -0.07283169, -2.2242064, 4.9038143, -1.4365499, -0.93810624, -0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.44595566, -0.07283169, 2.2242064, -4.9038143, -1.4365499, -0.93810624, 0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -260,6 +261,8 @@ class TaskPlanner:
                 task = JskMessyTableTaskWithChair(
                     obstacles_param, chairs_param, pose, reaching_pose
                 )
+                conf = copy.deepcopy(Pr2ThesisJskTable2.solver_config)
+                conf.refine_seq = [RefineType.SHORTCUT, RefineType.BSPLINE]
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(task.export_problem())
                 init_traj = self.engine.lib.init_solutions[min_idx]
@@ -527,7 +530,16 @@ class RepairPlanner:
             # assert self.collision_cst_base_only.is_valid(post_remove_pr2_pose)
             assert self.collision_cst_base_only.is_valid(pr2_final_pose)
 
-            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+            ompl_solver_config = OMPLSolverConfig(
+                refine_seq=[
+                    RefineType.SHORTCUT,
+                    RefineType.BSPLINE,
+                    RefineType.SHORTCUT,
+                    RefineType.BSPLINE,
+                ]
+            )
+
+            solver = OMPLSolver(ompl_solver_config)
             problem = Problem(
                 post_remove_pr2_pose,
                 self.pr2_pose_lb,
@@ -546,7 +558,7 @@ class RepairPlanner:
             sdf_original = self.chair_manager.create_sdf()
             sdf_original.merge(self.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf_original)
-            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+            solver = OMPLSolver(ompl_solver_config)
 
             problem = Problem(
                 planning_result.base_path_to_pre_remove_chair[0],
@@ -567,7 +579,7 @@ class RepairPlanner:
             self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
 
             # for q in planning_result.base_path_to_post_remove_chair:
-            solver = OMPLSolver(OMPLSolverConfig(shortcut=True, bspline=True))
+            solver = OMPLSolver(ompl_solver_config)
             problem = Problem(
                 planning_result.base_path_to_post_remove_chair[0],
                 self.pr2_pose_lb,
