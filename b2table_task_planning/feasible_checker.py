@@ -30,6 +30,7 @@ from rpbench.articulated.pr2.thesis_jsk_table import (
 from rpbench.articulated.vision import create_heightmap_z_slice
 from rpbench.articulated.world.utils import BoxSkeleton
 from skrobot.coordinates import Coordinates
+from skrobot.model import Axis
 from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
@@ -297,7 +298,7 @@ class RepairPlanner:
     tree_current: MultiGoalRRT
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
-    CHAIR_GRASP_BASE_OFFSET = 0.8
+    CHAIR_GRASP_BASE_OFFSET = 0.7
 
     def __init__(
         self,
@@ -510,19 +511,29 @@ class RepairPlanner:
 
 
 class SceneVisualizer:
-    def __init__(self, pr2_pose, chairs_param: np.ndarray):
+    def __init__(self, init_pr2_pose, final_gripper_pose: np.ndarray, chairs_param: np.ndarray):
         self.table = JskTable()
+        self.final_gripper_pose = final_gripper_pose
         self.chair_manager = ChairManager()
         self.chair_manager.set_param(chairs_param)
         self.pr2 = PR2(use_tight_joint_limit=False)
         self.pr2.angle_vector(AV_INIT)
-        self.pr2.newcoords(Coordinates([pr2_pose[0], pr2_pose[1], 0.0], [pr2_pose[2], 0.0, 0.0]))
+        self.pr2.newcoords(
+            Coordinates([init_pr2_pose[0], init_pr2_pose[1], 0.0], [init_pr2_pose[2], 0.0, 0.0])
+        )
         self.chair_handles_list = []
         self.v = None
 
     def visualize(self):
         v = PyrenderViewer()
         self.table.visualize(v)
+
+        axis = Axis()
+        gripper_pos, yaw = self.final_gripper_pose[:3], self.final_gripper_pose[3]
+        axis.translate(gripper_pos)
+        axis.rotate(yaw, "z")
+        v.add(axis)
+
         for i_chair in range(self.chair_manager.n_chair):
             chair = self.chair_manager.chairs[i_chair]
             handles = chair.visualize(v)
