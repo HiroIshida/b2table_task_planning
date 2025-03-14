@@ -13,6 +13,8 @@ from rpbench.articulated.pr2.thesis_jsk_table import (
 from rpbench.articulated.world.utils import BoxSkeleton
 from rpbench.planer_box_utils import Box2d, PlanerCoords
 
+from b2table_task_planning.cython import compute_box2d_sd
+
 
 class SituationSampler:
     table2d_box: Box2d  # to compute 2d sdf of the table
@@ -106,16 +108,20 @@ class SituationSampler:
 
     def sample_pr2_pose(self, n_max_trial: int = 100) -> Optional[np.ndarray]:
         points = self.target_region.sample_points(n_max_trial)
+
         dists = np.linalg.norm(points[:, :2] - self.reaching_pose[:2], axis=1)
-        points_inside = points[dists < 0.8]
-        for point in points_inside:
-            point = point[:2]
-            sd = self.table2d_box.sd(point.reshape(1, 2))[0]
+        points_inside = points[dists < 0.8][:, :2]
+        yaw_pluss = np.random.uniform(-np.pi / 4, np.pi / 4, size=(len(points_inside), 1))
+        yaw_cands = fit_radian(self.reaching_pose[3] + yaw_pluss)
+        vector_coords = np.hstack([points_inside, yaw_cands])
+
+        for vector in vector_coords:
+            point = vector[:2]
+            sd = compute_box2d_sd(
+                point.reshape(1, 2), self.table2d_box.extent, self.table2d_box.coords.pos
+            )[0]
             if sd > 0.55 or sd < 0.0:
                 continue
-            yaw_reaching = self.reaching_pose[3]
-            yaw = fit_radian(yaw_reaching + np.random.uniform(-np.pi / 4, np.pi / 4))
-            pr2_coords = np.hstack([point, yaw])
-            if self.cst.is_valid(pr2_coords):
-                return pr2_coords
+            if self.cst.is_valid(vector):
+                return vector
         return None
