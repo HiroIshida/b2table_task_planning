@@ -531,13 +531,22 @@ class SceneVisualizer:
         v.show()
         self.v = v
 
-    def visualize_base_trajectory(self, traj: Trajectory):
+    def visualize_base_trajectory(self, traj: Trajectory, fix_chair_idx: Optional[int] = None):
         assert self.v
         spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        assoc = False
         for q_base in traj.resample(100):
             spec.set_skrobot_model_state(self.pr2, q_base)
+            if not assoc and fix_chair_idx is not None:
+                vis_prim_handles = self.chair_handles_list[fix_chair_idx]
+                for prim in vis_prim_handles:
+                    self.pr2.assoc(prim)
+                assoc = True
             self.v.redraw()
             time.sleep(0.05)
+        if assoc:
+            for prim in vis_prim_handles:
+                self.pr2.dissoc(prim)
 
     def visualize_joint_trajectory(self, traj: Trajectory, is_rarm: bool):
         assert self.v
@@ -579,7 +588,7 @@ if __name__ == "__main__":
         input("Press Enter to continue...")
         sv.visualize_chair_rotation(plan.remove_chair_idx, plan.chair_rotation_angle)
         input("Press Enter to continue...")
-        sv.visualize_base_trajectory(plan.base_path_to_post_remove_chair)
+        sv.visualize_base_trajectory(plan.base_path_to_post_remove_chair, plan.remove_chair_idx)
         input("Press Enter to continue...")
         sv.visualize_base_trajectory(plan.base_path_final)
         input("Press Enter to continue...")
