@@ -262,8 +262,9 @@ class TaskPlanner:
                     result.base_path_final = Trajectory(current_tree.get_solution(pose).T)
                     return result
 
-        assert False, "not supposed to reach here, but there is still very small chance to reach here..."
-
+        assert (
+            False
+        ), "not supposed to reach here, but there is still very small chance to reach here..."
 
     def _sample_pr2_pose(self) -> Optional[np.ndarray]:
         pose_list = []
@@ -291,7 +292,7 @@ class TaskPlanner:
         cst = pr2_spec.create_collision_const()
         cst.set_sdf(sdf)
 
-        tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 1000)
+        tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 2000)
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
         if not np.any(bools):
             return None, tree
@@ -383,12 +384,14 @@ class RepairPlanner:
                 self.pr2_pose_lb,
                 self.pr2_pose_ub,
                 self.collision_cst_base_only,
-                1000,
+                2000,
             )
             bools = tree_completely_removed.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
             reachable_poses = self.final_pr2_pose_cands[bools]
             if len(reachable_poses) == 0:
-                print(f"giving up the chair {i_chair} because no feasible base pose found even after completely removing the chair")
+                print(
+                    f"giving up the chair {i_chair} because no feasible base pose found even after completely removing the chair"
+                )
                 continue
 
             # check if the robot arm can reach the goal pose
@@ -397,7 +400,9 @@ class RepairPlanner:
             vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
             is_feasibiles, min_indices = self.engine.infer(vectors, self.table_mat, ground_mat)
             if not np.any(is_feasibiles):
-                print(f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair")
+                print(
+                    f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair"
+                )
                 continue
 
             # check if i_chair can be graspable
@@ -433,7 +438,9 @@ class RepairPlanner:
                 planning_result.is_rarm = reaching_task.is_using_rarm()
                 break
             if feasible_pr2_final_pose is None:
-                print(f"giving up the chair {i_chair} because the arm planning is not 'actually' feasible even after completely removing the chair")
+                print(
+                    f"giving up the chair {i_chair} because the arm planning is not 'actually' feasible even after completely removing the chair"
+                )
                 continue
 
             # check if feasible placment of the chair is possible
@@ -449,7 +456,7 @@ class RepairPlanner:
                 self.pr2_pose_lb,
                 self.pr2_pose_ub,
                 self.collision_cst_with_chair,
-                1000,
+                2000,
             )
             pr2_model.angle_vector(AV_INIT)
             self.base_spec.reflect_skrobot_model_to_kin(pr2_model)  # reset the kin model
@@ -618,6 +625,7 @@ if __name__ == "__main__":
 
     start = np.array([0.784, 2.57, -2.0])
     from pyinstrument import Profiler
+
     profiler = Profiler()
     profiler.start()
     plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
