@@ -373,6 +373,10 @@ class RepairPlanner:
         self.tree_current = tree_current
 
     def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
+        self.common.chair_manager.set_param(chairs_param_original)
+        sdf_original = self.common.chair_manager.create_sdf()
+        sdf_original.merge(self.common.table.create_sdf())
+
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
             chair_pose_remove = chairs_param_original[i_chair * 3 : (i_chair + 1) * 3]
@@ -518,74 +522,68 @@ class RepairPlanner:
             self.common.chair_manager.set_param(chairs_param_post_remove)
             sdf_post_remove = self.common.chair_manager.create_sdf()
             sdf_post_remove.merge(self.common.table.create_sdf())
-            self.common.collision_cst_base_only.set_sdf(sdf_post_remove)
-
-            ompl_solver_config = OMPLSolverConfig(
-                refine_seq=[
-                    RefineType.SHORTCUT,
-                    RefineType.BSPLINE,
-                    RefineType.SHORTCUT,
-                    RefineType.BSPLINE,
-                ]
+            planning_result.base_path_final = self.solve_base_motion_planning(
+                valid_post_remove_pr2_pose,
+                feasible_pr2_final_pose,
+                sdf_post_remove,
+                grasping_chair=False,
             )
 
-            solver = OMPLSolver(ompl_solver_config)
-            problem = Problem(
-                post_remove_pr2_pose,
-                self.common.pr2_pose_lb,
-                self.common.pr2_pose_ub,
-                pr2_final_pose,
-                self.common.collision_cst_base_only,
-                None,
-                np.array([0.1, 0.1, 0.1]),
-            )
-            ret = solver.solve(problem)
-            planning_result.base_path_final = ret.traj
-
-            # optionally? smooth result of the base_path_to_pre_remove_chair
-            self.common.collision_cst_base_only.set_sdf(sdf_hypo)
-            self.common.chair_manager.set_param(chairs_param_original)
-            sdf_original = self.common.chair_manager.create_sdf()
-            sdf_original.merge(self.common.table.create_sdf())
-            self.common.collision_cst_base_only.set_sdf(sdf_original)
-            solver = OMPLSolver(ompl_solver_config)
-
-            problem = Problem(
+            # optionally? sommoth out the trajectories which are already feasible
+            planning_result.base_path_to_pre_remove_chair = self.solve_base_motion_planning(
                 planning_result.base_path_to_pre_remove_chair[0],
-                self.common.pr2_pose_lb,
-                self.common.pr2_pose_ub,
                 planning_result.base_path_to_pre_remove_chair[-1],
-                self.common.collision_cst_base_only,
-                None,
-                np.array([0.1, 0.1, 0.1]),
+                sdf_original,
+                grasping_chair=False,
             )
-            ret = solver.solve(problem)
-            assert ret.traj is not None, "this should not happen"
-            planning_result.base_path_to_pre_remove_chair = ret.traj
 
-            # optionally? smooth result of the base_path_to_post_remove_chair
-            self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
-            self.common.pr2_model.angle_vector(AV_CHAIR_GRASP)
-            self.common.base_spec.reflect_skrobot_model_to_kin(self.common.pr2_model)
-
-            # for q in planning_result.base_path_to_post_remove_chair:
-            solver = OMPLSolver(ompl_solver_config)
-            problem = Problem(
+            planning_result.base_path_to_post_remove_chair = self.solve_base_motion_planning(
                 planning_result.base_path_to_post_remove_chair[0],
-                self.common.pr2_pose_lb,
-                self.common.pr2_pose_ub,
                 planning_result.base_path_to_post_remove_chair[-1],
-                self.common.collision_cst_with_chair,
-                None,
-                np.array([0.1, 0.1, 0.1]),
+                sdf_hypo,
+                grasping_chair=True,
             )
-            ret = solver.solve(problem)
-            assert ret.traj is not None, "this should not happen"
-            planning_result.base_path_to_post_remove_chair = ret.traj
-
             return planning_result
         print("tried to repair the environment but failed")
         return None
+
+    def solve_base_motion_planning(
+        self, start: np.ndarray, goal: np.ndarray, sdf: UnionSDF, grasping_chair: bool
+    ) -> Trajectory:
+        # here, we assume that the problem is feasible
+        if grasping_chair:
+            angle_vector = AV_CHAIR_GRASP
+            cst = self.common.collision_cst_with_chair
+        else:
+            angle_vector = AV_INIT
+            cst = self.common.collision_cst_base_only
+
+        cst.set_sdf(sdf)
+        self.common.pr2_model.angle_vector(angle_vector)
+        self.common.base_spec.reflect_skrobot_model_to_kin(self.common.pr2_model)
+
+        ompl_solver_config = OMPLSolverConfig(
+            refine_seq=[
+                RefineType.SHORTCUT,
+                RefineType.BSPLINE,
+                RefineType.SHORTCUT,
+                RefineType.BSPLINE,
+            ]
+        )
+
+        solver = OMPLSolver(ompl_solver_config)
+        problem = Problem(
+            start,
+            self.common.pr2_pose_lb,
+            self.common.pr2_pose_ub,
+            goal,
+            cst,
+            None,
+            np.array([0.1, 0.1, 0.1]),
+        )
+        ret = solver.solve(problem)
+        assert ret.traj is not None, "this should not happen"
+        return ret.traj
 
     def determine_pregrasp_chair_pr2_base_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT
