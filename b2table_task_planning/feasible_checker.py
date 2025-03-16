@@ -392,16 +392,11 @@ class RepairPlanner:
             planning_result.remove_chair_idx = i_chair
 
             # check if i_chair can be graspable
-            ret = self.determine_pregrasp_chair_pr2_base_pose(chair_pose_remove, self.tree_current)
-            if ret is None:
-                print(f"giving up the chair {i_chair} because grasping base pose is not reachable")
-                continue
-            pre_remove_pr2_pose, yaw_rot = ret
-
-            planning_result.base_path_to_pre_remove_chair = Trajectory(
-                self.tree_current.get_solution(pre_remove_pr2_pose).T
+            success = self.plan_base_motion_to_chair_grasp_pose(
+                chair_pose_remove, self.tree_current, planning_result
             )
-            planning_result.chair_rotation_angle = yaw_rot
+            if not success:
+                continue
 
             # first check if the robot base can reach the goal
             tree_completely_removed = MultiGoalRRT(
@@ -469,7 +464,7 @@ class RepairPlanner:
             self.common.pr2_model.angle_vector(AV_CHAIR_GRASP)
             self.common.base_spec.reflect_skrobot_model_to_kin(self.common.pr2_model)
             tree_chair_attach = MultiGoalRRT(
-                pre_remove_pr2_pose,
+                planning_result.base_path_to_pre_remove_chair[-1],
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 self.common.collision_cst_with_chair,
@@ -584,9 +579,10 @@ class RepairPlanner:
         assert ret.traj is not None, "this should not happen"
         return ret.traj
 
-    def determine_pregrasp_chair_pr2_base_pose(
-        self, chair_pose: np.ndarray, tree: MultiGoalRRT
-    ) -> Optional[Tuple[np.ndarray, float]]:
+    def plan_base_motion_to_chair_grasp_pose(
+        self, chair_pose: np.ndarray, tree: MultiGoalRRT, result: PlanningResult
+    ) -> bool:
+
         # check if blocking chair is actually removable by
         # hypothetically chaing the chair yaw angles
         # assuming that PR2 can rotate the chair by 90 degrees
@@ -601,14 +597,18 @@ class RepairPlanner:
         pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
         bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
         if not np.any(bools):
-            return None
+            print("no reachable pre-grasp base pose found")
+            return False
 
         min_yaw = yaw_cands[bools].min()
         x = x - CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
         y = y - CHAIR_GRASP_BASE_OFFSET * np.sin(min_yaw)
         pre_grasp_base_pose = np.array([x, y, min_yaw])
         yaw_rotate = min_yaw - chair_pose[2]
-        return pre_grasp_base_pose, yaw_rotate
+        result.chair_rotation_angle = yaw_rotate
+
+        result.base_path_to_pre_remove_chair = Trajectory(tree.get_solution(pre_grasp_base_pose).T)
+        return True
 
 
 class SceneVisualizer:
