@@ -43,7 +43,7 @@ from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
 from b2table_task_planning.sampler import SituationSampler
-from b2table_task_planning.scenario import barely_feasible_task
+from b2table_task_planning.scenario import need_fix_task
 
 # fmt: off
 AV_CHAIR_GRASP = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.87266463, 0.0, -0.44595566, -0.07283169, -2.2242064, 4.9038143, -1.4365499, -0.93810624, -0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.44595566, -0.07283169, 2.2242064, -4.9038143, -1.4365499, -0.93810624, 0.6677667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -712,20 +712,16 @@ class SceneVisualizer:
 
 if __name__ == "__main__":
     np.random.seed(1)
-    # set_srand(1)
     set_random_seed(0)
-    task = barely_feasible_task()
-    # task = need_fix_task()
+    task = need_fix_task()
     task_planner = TaskPlanner()
 
     start = np.array([0.784, 2.57, -2.0])
-    from pyinstrument import Profiler
-
-    profiler = Profiler()
-    profiler.start()
+    ts = time.time()
     plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
-    profiler.stop()
-    print(profiler.output_text(unicode=True, color=True, show_all=False))
+    print(f"elapsed time: {time.time() - ts:.3f} [sec]")
+    print(f"hash value: {plan.hash_value()}")
+
     sv = SceneVisualizer(start, task.reaching_pose, task.chairs_param)
     sv.visualize()
     time.sleep(2)
