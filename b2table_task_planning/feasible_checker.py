@@ -391,6 +391,18 @@ class RepairPlanner:
             planning_result = PlanningResult()
             planning_result.remove_chair_idx = i_chair
 
+            # check if i_chair can be graspable
+            ret = self.determine_pregrasp_chair_pr2_base_pose(chair_pose_remove, self.tree_current)
+            if ret is None:
+                print(f"giving up the chair {i_chair} because grasping base pose is not reachable")
+                continue
+            pre_remove_pr2_pose, yaw_rot = ret
+
+            planning_result.base_path_to_pre_remove_chair = Trajectory(
+                self.tree_current.get_solution(pre_remove_pr2_pose).T
+            )
+            planning_result.chair_rotation_angle = yaw_rot
+
             # first check if the robot base can reach the goal
             tree_completely_removed = MultiGoalRRT(
                 self.problem.pr2_pose_now,
@@ -419,18 +431,6 @@ class RepairPlanner:
                     f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair"
                 )
                 continue
-
-            # check if i_chair can be graspable
-            ret = self.determine_pregrasp_chair_pr2_base_pose(chair_pose_remove, self.tree_current)
-            if ret is None:
-                print(f"giving up the chair {i_chair} because grasping base pose is not reachable")
-                continue
-            pre_remove_pr2_pose, yaw_rot = ret
-
-            planning_result.base_path_to_pre_remove_chair = Trajectory(
-                self.tree_current.get_solution(pre_remove_pr2_pose).T
-            )
-            planning_result.chair_rotation_angle = yaw_rot
 
             # check if the detected situation is feasible by actually solving the problem
             feasible_pr2_final_pose = None
