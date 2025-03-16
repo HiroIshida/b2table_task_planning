@@ -200,76 +200,73 @@ class CommonResource:
         self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
 
 
+@dataclass
+class PlanningProblem:
+    pr2_pose_now: np.ndarray
+    reaching_pose: np.ndarray
+    obstacles_param: np.ndarray
+    chairs_param: np.ndarray
+
+
 class TaskPlanner:
     common: CommonResource
 
     def __init__(self):
         self.common = CommonResource()
 
-    def plan(
-        self,
-        pr2_pose_now: np.ndarray,
-        reaching_pose: np.ndarray,
-        obstacles_param: np.ndarray,
-        chairs_param: np.ndarray,
-    ) -> Optional[PlanningResult]:
-
+    def plan(self, problem: PlanningProblem) -> Optional[PlanningResult]:
         # check if pr2_pose_now is inside lb and ub
-        if not np.all(pr2_pose_now[:2] > self.common.pr2_pose_lb[:2]) or not np.all(
-            pr2_pose_now[:2] < self.common.pr2_pose_ub[:2]
+        if not np.all(problem.pr2_pose_now[:2] > self.common.pr2_pose_lb[:2]) or not np.all(
+            problem.pr2_pose_now[:2] < self.common.pr2_pose_ub[:2]
         ):
             print("pr2_pose_now is out of the bound")
             return None
 
         # here we assume that only chair is movable
-        self.common.sampler.register_tabletop_obstacles(obstacles_param)
-        self.common.sampler.register_reaching_pose(reaching_pose)
-        self.common.chair_manager.set_param(chairs_param)
+        self.common.sampler.register_tabletop_obstacles(problem.obstacles_param)
+        self.common.sampler.register_reaching_pose(problem.reaching_pose)
+        self.common.chair_manager.set_param(problem.chairs_param)
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
         recahable_pr2_poses, current_tree = self._select_reachable_poses(
-            pr2_pose_now, pr2_pose_cands
+            problem.pr2_pose_now, pr2_pose_cands
         )
 
         if recahable_pr2_poses is None:
             rplanner = RepairPlanner(
+                problem,
                 self.common,
-                pr2_pose_now,
                 pr2_pose_cands,
-                reaching_pose,
-                obstacles_param,
-                create_map_from_obstacle_param(obstacles_param),
+                create_map_from_obstacle_param(problem.obstacles_param),
                 current_tree,
             )
-            return rplanner.plan(chairs_param)
+            return rplanner.plan(problem.chairs_param)
 
         # finally
-        table_mat = create_map_from_obstacle_param(obstacles_param)
-        ground_mat = create_map_from_chair_param(chairs_param)
+        table_mat = create_map_from_obstacle_param(problem.obstacles_param)
+        ground_mat = create_map_from_chair_param(problem.chairs_param)
 
-        reaching_pose_tile = np.tile(reaching_pose, (recahable_pr2_poses.shape[0], 1))
+        reaching_pose_tile = np.tile(problem.reaching_pose, (recahable_pr2_poses.shape[0], 1))
         vectors = np.concatenate([recahable_pr2_poses, reaching_pose_tile], axis=1)
         is_feasibiles, min_indices = self.common.engine.infer(vectors, table_mat, ground_mat)
 
         # check if any feasible solution exists
         if not np.any(is_feasibiles):
             rplanner = RepairPlanner(
+                problem,
                 self.common,
-                pr2_pose_now,
                 pr2_pose_cands,
-                reaching_pose,
-                obstacles_param,
                 table_mat,
                 current_tree,
             )
-            return rplanner.plan(chairs_param)
+            return rplanner.plan(problem.chairs_param)
 
         print("now the phase of finding feasible solution by actually solving the problem")
         for pose, is_feasible, min_idx in zip(recahable_pr2_poses, is_feasibiles, min_indices):
             if is_feasible:
                 task = JskMessyTableTaskWithChair(
-                    obstacles_param, chairs_param, pose, reaching_pose
+                    problem.obstacles_param, problem.chairs_param, pose, problem.reaching_pose
                 )
                 conf = copy.deepcopy(Pr2ThesisJskTable2.solver_config)
                 conf.refine_seq = [RefineType.SHORTCUT, RefineType.BSPLINE]
@@ -353,10 +350,8 @@ _BASE_SPEC, _COLLISION_CST_BASE_ONLY, _COLLISION_CST_WITH_CHAIR = setup_spec_and
 
 class RepairPlanner:
     common: CommonResource
-    init_pr2_pose: np.ndarray
+    problem: PlanningProblem
     final_pr2_pose_cands: np.ndarray
-    final_gripper_pose: np.ndarray
-    obstacle_param: np.ndarray
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
     tree_current: MultiGoalRRT
     base_spec: PR2BaseOnlySpec
@@ -365,19 +360,15 @@ class RepairPlanner:
 
     def __init__(
         self,
+        problem: PlanningProblem,
         common: CommonResource,
-        init_pr2_pose: np.ndarray,
         final_pr2_pose_cands: np.ndarray,
-        final_gripper_pose: np.ndarray,
-        obstacle_param: np.ndarray,
         table_mat: np.ndarray,
         tree_current: MultiGoalRRT,
     ):
+        self.problem = problem
         self.common = common
-        self.init_pr2_pose = init_pr2_pose
         self.final_pr2_pose_cands = final_pr2_pose_cands
-        self.final_gripper_pose = final_gripper_pose
-        self.obstacle_param = obstacle_param
         self.table_mat = table_mat
         self.tree_current = tree_current
 
@@ -403,7 +394,7 @@ class RepairPlanner:
 
             # first check if the robot base can reach the goal
             tree_completely_removed = MultiGoalRRT(
-                self.init_pr2_pose,
+                self.problem.pr2_pose_now,
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 self.collision_cst_base_only,
@@ -419,7 +410,7 @@ class RepairPlanner:
 
             # check if the robot arm can reach the goal pose
             ground_mat = create_map_from_chair_param(chairs_param_hypo)
-            gripper_pose_tile = np.tile(self.final_gripper_pose, (reachable_poses.shape[0], 1))
+            gripper_pose_tile = np.tile(self.problem.reaching_pose, (reachable_poses.shape[0], 1))
             vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
             is_feasibiles, min_indices = self.common.engine.infer(
                 vectors, self.table_mat, ground_mat
@@ -450,7 +441,10 @@ class RepairPlanner:
                 if not is_feasible:
                     continue
                 reaching_task = JskMessyTableTaskWithChair(
-                    self.obstacle_param, chairs_param_hypo, pr2_final_pose, self.final_gripper_pose
+                    self.problem.obstacles_param,
+                    chairs_param_hypo,
+                    pr2_final_pose,
+                    self.problem.reaching_pose,
                 )
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(reaching_task.export_problem())
@@ -707,14 +701,18 @@ if __name__ == "__main__":
     set_random_seed(0)
     task = need_fix_task()
     task_planner = TaskPlanner()
-
-    start = np.array([0.784, 2.57, -2.0])
+    problem = PlanningProblem(
+        np.array([0.784, 2.57, -2.0]),
+        task.reaching_pose,
+        task.obstacles_param,
+        task.chairs_param,
+    )
     ts = time.time()
-    plan = task_planner.plan(start, task.reaching_pose, task.obstacles_param, task.chairs_param)
+    plan = task_planner.plan(problem)
     print(f"elapsed time: {time.time() - ts:.3f} [sec]")
     print(f"hash value: {plan.hash_value()}")
 
-    sv = SceneVisualizer(start, task.reaching_pose, task.chairs_param)
+    sv = SceneVisualizer(problem.pr2_pose_now, task.reaching_pose, task.chairs_param)
     sv.visualize()
     time.sleep(2)
     if plan is None:
