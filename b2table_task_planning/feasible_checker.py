@@ -184,6 +184,9 @@ class CommonResource:
     table: JskTable
     pr2_pose_lb: np.ndarray
     pr2_pose_ub: np.ndarray
+    base_spec: PR2BaseOnlySpec
+    collision_cst_base_only: SphereCollisionCst
+    collision_cst_with_chair: SphereCollisionCst
 
     def __init__(self):
         self.sampler = SituationSampler()
@@ -198,6 +201,31 @@ class CommonResource:
         region_ub[1] += 1.0
         self.pr2_pose_lb = np.hstack([region_lb[:2], [-np.pi * 1.5]])
         self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
+
+        # prepare spec
+        base_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        self.base_spec = base_spec
+
+        # prepare collision constraint
+        skmodel = base_spec.get_robot_model(deepcopy=False)
+        skmodel.angle_vector(AV_INIT)
+        base_spec.reflect_skrobot_model_to_kin(skmodel)
+        collision_cst_base_only = base_spec.create_collision_const()
+        self.collision_cst_base_only = collision_cst_base_only
+
+        # prepare chair-attached collision constraint
+        chair_bbox_lb = np.array([-JskChair.DEPTH * 0.5, -JskChair.WIDTH * 0.5, 0.0])
+        chair_bbox_ub = np.array([JskChair.DEPTH * 0.5, JskChair.WIDTH * 0.5, JskChair.BACK_HEIGHT])
+        x = np.linspace(chair_bbox_lb[0], chair_bbox_ub[0], 10)
+        y = np.linspace(chair_bbox_lb[1], chair_bbox_ub[1], 10)
+        z = np.linspace(chair_bbox_lb[2], chair_bbox_ub[2], 20)
+        xx, yy, zz = np.meshgrid(x, y, z)
+        cloud = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
+        cloud[:, 0] += CHAIR_GRASP_BASE_OFFSET
+        aspec = SphereAttachmentSpec("base_footprint", cloud.T, np.ones(len(cloud)) * 0.05, False)
+        coll_cst_with_chair = base_spec.create_collision_const(attachements=(aspec,))
+        collision_cst_with_chair = coll_cst_with_chair
+        self.collision_cst_with_chair = collision_cst_with_chair
 
 
 @dataclass
@@ -321,42 +349,12 @@ class TaskPlanner:
         return pose_list[bools], tree
 
 
-def setup_spec_and_coll_cst():
-    base_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-
-    # prepare collision constraint
-    skmodel = base_spec.get_robot_model(deepcopy=False)
-    skmodel.angle_vector(AV_INIT)
-    base_spec.reflect_skrobot_model_to_kin(skmodel)
-    collision_cst_base_only = base_spec.create_collision_const()
-
-    # prepare chair-attached collision constraint
-    chair_bbox_lb = np.array([-JskChair.DEPTH * 0.5, -JskChair.WIDTH * 0.5, 0.0])
-    chair_bbox_ub = np.array([JskChair.DEPTH * 0.5, JskChair.WIDTH * 0.5, JskChair.BACK_HEIGHT])
-    x = np.linspace(chair_bbox_lb[0], chair_bbox_ub[0], 10)
-    y = np.linspace(chair_bbox_lb[1], chair_bbox_ub[1], 10)
-    z = np.linspace(chair_bbox_lb[2], chair_bbox_ub[2], 20)
-    xx, yy, zz = np.meshgrid(x, y, z)
-    cloud = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
-    cloud[:, 0] += CHAIR_GRASP_BASE_OFFSET
-    aspec = SphereAttachmentSpec("base_footprint", cloud.T, np.ones(len(cloud)) * 0.05, False)
-    coll_cst_with_chair = base_spec.create_collision_const(attachements=(aspec,))
-    collision_cst_with_chair = coll_cst_with_chair
-    return base_spec, collision_cst_base_only, collision_cst_with_chair
-
-
-_BASE_SPEC, _COLLISION_CST_BASE_ONLY, _COLLISION_CST_WITH_CHAIR = setup_spec_and_coll_cst()
-
-
 class RepairPlanner:
     common: CommonResource
     problem: PlanningProblem
     final_pr2_pose_cands: np.ndarray
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
     tree_current: MultiGoalRRT
-    base_spec: PR2BaseOnlySpec
-    collision_cst_base_only: SphereCollisionCst
-    collision_cst_with_chair: SphereCollisionCst
 
     def __init__(
         self,
@@ -372,11 +370,6 @@ class RepairPlanner:
         self.table_mat = table_mat
         self.tree_current = tree_current
 
-        # do this because creating the spec and collision constraint is expensive
-        self.base_spec = _BASE_SPEC
-        self.collision_cst_base_only = _COLLISION_CST_BASE_ONLY
-        self.collision_cst_with_chair = _COLLISION_CST_WITH_CHAIR
-
     def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
@@ -387,7 +380,7 @@ class RepairPlanner:
             self.common.chair_manager.set_param(chairs_param_hypo)
             sdf_hypo = self.common.chair_manager.create_sdf()
             sdf_hypo.merge(self.common.table.create_sdf())
-            self.collision_cst_base_only.set_sdf(sdf_hypo)
+            self.common.collision_cst_base_only.set_sdf(sdf_hypo)
 
             planning_result = PlanningResult()
             planning_result.remove_chair_idx = i_chair
@@ -397,7 +390,7 @@ class RepairPlanner:
                 self.problem.pr2_pose_now,
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
-                self.collision_cst_base_only,
+                self.common.collision_cst_base_only,
                 2000,
             )
             bools = tree_completely_removed.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
@@ -466,19 +459,19 @@ class RepairPlanner:
             path = tree_completely_removed.get_solution(feasible_pr2_final_pose).T
             traj = Trajectory(path).resample(100)
 
-            self.collision_cst_with_chair.set_sdf(sdf_hypo)
-            pr2_model = self.base_spec.get_robot_model(deepcopy=False)
+            self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
+            pr2_model = self.common.base_spec.get_robot_model(deepcopy=False)
             pr2_model.angle_vector(AV_CHAIR_GRASP)
-            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
+            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)
             tree_chair_attach = MultiGoalRRT(
                 pre_remove_pr2_pose,
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
-                self.collision_cst_with_chair,
+                self.common.collision_cst_with_chair,
                 2000,
             )
             pr2_model.angle_vector(AV_INIT)
-            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)  # reset the kin model
+            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)  # reset the kin model
             nodes = tree_chair_attach.get_debug_states()
             dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
             sorted_indices = np.argsort(dists)
@@ -488,8 +481,8 @@ class RepairPlanner:
             for ind in sorted_indices:
                 post_remove_pr2_pose = nodes[ind]
                 # check if post_remove_pr2_pose is collision free (this is required because we only know that this position is collision free at the grasping pose)
-                self.collision_cst_base_only.set_sdf(sdf_hypo)
-                if not self.collision_cst_base_only.is_valid(post_remove_pr2_pose):
+                self.common.collision_cst_base_only.set_sdf(sdf_hypo)
+                if not self.common.collision_cst_base_only.is_valid(post_remove_pr2_pose):
                     continue
 
                 chair_pose = post_remove_pr2_pose + np.array(
@@ -501,9 +494,9 @@ class RepairPlanner:
                 )
                 self.common.chair_manager.set_param(chair_pose)
                 sdf_single_chair = self.common.chair_manager.create_sdf()
-                self.collision_cst_base_only.set_sdf(sdf_single_chair)
+                self.common.collision_cst_base_only.set_sdf(sdf_single_chair)
                 is_collision_free = np.all(
-                    [self.collision_cst_base_only.is_valid(q) for q in traj.numpy()]
+                    [self.common.collision_cst_base_only.is_valid(q) for q in traj.numpy()]
                 )
                 if not is_collision_free:
                     continue
@@ -522,10 +515,7 @@ class RepairPlanner:
             self.common.chair_manager.set_param(chairs_param_post_remove)
             sdf_post_remove = self.common.chair_manager.create_sdf()
             sdf_post_remove.merge(self.common.table.create_sdf())
-            self.collision_cst_base_only.set_sdf(sdf_post_remove)
-
-            # assert self.collision_cst_base_only.is_valid(post_remove_pr2_pose)
-            assert self.collision_cst_base_only.is_valid(pr2_final_pose)
+            self.common.collision_cst_base_only.set_sdf(sdf_post_remove)
 
             ompl_solver_config = OMPLSolverConfig(
                 refine_seq=[
@@ -542,7 +532,7 @@ class RepairPlanner:
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 pr2_final_pose,
-                self.collision_cst_base_only,
+                self.common.collision_cst_base_only,
                 None,
                 np.array([0.1, 0.1, 0.1]),
             )
@@ -550,11 +540,11 @@ class RepairPlanner:
             planning_result.base_path_final = ret.traj
 
             # optionally? smooth result of the base_path_to_pre_remove_chair
-            self.collision_cst_base_only.set_sdf(sdf_hypo)
+            self.common.collision_cst_base_only.set_sdf(sdf_hypo)
             self.common.chair_manager.set_param(chairs_param_original)
             sdf_original = self.common.chair_manager.create_sdf()
             sdf_original.merge(self.common.table.create_sdf())
-            self.collision_cst_base_only.set_sdf(sdf_original)
+            self.common.collision_cst_base_only.set_sdf(sdf_original)
             solver = OMPLSolver(ompl_solver_config)
 
             problem = Problem(
@@ -562,7 +552,7 @@ class RepairPlanner:
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 planning_result.base_path_to_pre_remove_chair[-1],
-                self.collision_cst_base_only,
+                self.common.collision_cst_base_only,
                 None,
                 np.array([0.1, 0.1, 0.1]),
             )
@@ -571,9 +561,9 @@ class RepairPlanner:
             planning_result.base_path_to_pre_remove_chair = ret.traj
 
             # optionally? smooth result of the base_path_to_post_remove_chair
-            self.collision_cst_with_chair.set_sdf(sdf_hypo)
+            self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
             pr2_model.angle_vector(AV_CHAIR_GRASP)
-            self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
+            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)
 
             # for q in planning_result.base_path_to_post_remove_chair:
             solver = OMPLSolver(ompl_solver_config)
@@ -582,7 +572,7 @@ class RepairPlanner:
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 planning_result.base_path_to_post_remove_chair[-1],
-                self.collision_cst_with_chair,
+                self.common.collision_cst_with_chair,
                 None,
                 np.array([0.1, 0.1, 0.1]),
             )
