@@ -229,6 +229,12 @@ class CommonResource:
         collision_cst_with_chair = coll_cst_with_chair
         self.collision_cst_with_chair = collision_cst_with_chair
 
+    def create_sdf_table_and_chairs(self, chairs_param: np.ndarray) -> UnionSDF:
+        self.chair_manager.set_param(chairs_param)
+        sdf = self.chair_manager.create_sdf()
+        sdf.merge(self.table.create_sdf())
+        return sdf
+
 
 @dataclass
 class PlanningProblem:
@@ -259,8 +265,9 @@ class TaskPlanner:
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
+        sdf_now = self.common.create_sdf_table_and_chairs(problem.chairs_param)
         recahable_pr2_poses, current_tree = self._select_reachable_poses(
-            problem.pr2_pose_now, pr2_pose_cands
+            problem.pr2_pose_now, pr2_pose_cands, sdf_now
         )
 
         if recahable_pr2_poses is None:
@@ -328,13 +335,10 @@ class TaskPlanner:
         return pose_list
 
     def _select_reachable_poses(
-        self, current_pose: np.ndarray, pose_list: np.ndarray
+        self, current_pose: np.ndarray, pose_list: np.ndarray, sdf: UnionSDF
     ) -> Tuple[Optional[np.ndarray], MultiGoalRRT]:
         # check if robot is placable at the sampled pose.
         # Also, return the tree as a bi-product
-        sdf = self.common.chair_manager.create_sdf()
-        sdf.merge(self.common.table.create_sdf())
-
         pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
         skmodel = pr2_spec.get_robot_model(deepcopy=False)
         skmodel.angle_vector(AV_INIT)
@@ -371,11 +375,9 @@ class RepairPlanner:
         self.final_pr2_pose_cands = final_pr2_pose_cands
         self.table_mat = table_mat
         self.tree_current = tree_current
+        self.sdf_original = self.common.create_sdf_table_and_chairs(problem.chairs_param)
 
     def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
-        self.common.chair_manager.set_param(chairs_param_original)
-        sdf_original = self.common.chair_manager.create_sdf()
-        sdf_original.merge(self.common.table.create_sdf())
 
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
@@ -383,9 +385,7 @@ class RepairPlanner:
             chairs_param_hypo = np.delete(
                 chairs_param_original, np.s_[3 * i_chair : 3 * i_chair + 3]
             )
-            self.common.chair_manager.set_param(chairs_param_hypo)
-            sdf_hypo = self.common.chair_manager.create_sdf()
-            sdf_hypo.merge(self.common.table.create_sdf())
+            sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
             self.common.collision_cst_base_only.set_sdf(sdf_hypo)
 
             planning_result = PlanningResult()
@@ -518,10 +518,9 @@ class RepairPlanner:
             )
 
             # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
-            chairs_param_post_remove = np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
-            self.common.chair_manager.set_param(chairs_param_post_remove)
-            sdf_post_remove = self.common.chair_manager.create_sdf()
-            sdf_post_remove.merge(self.common.table.create_sdf())
+            sdf_post_remove = self.common.create_sdf_table_and_chairs(
+                np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
+            )
             planning_result.base_path_final = self.solve_base_motion_planning(
                 valid_post_remove_pr2_pose,
                 feasible_pr2_final_pose,
@@ -533,7 +532,7 @@ class RepairPlanner:
             planning_result.base_path_to_pre_remove_chair = self.solve_base_motion_planning(
                 planning_result.base_path_to_pre_remove_chair[0],
                 planning_result.base_path_to_pre_remove_chair[-1],
-                sdf_original,
+                self.sdf_original,
                 grasping_chair=False,
             )
 
