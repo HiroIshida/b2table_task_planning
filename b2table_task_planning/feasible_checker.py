@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import pickle
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -11,7 +13,12 @@ from hifuku.domain import Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
 from plainmp.constraint import SphereCollisionCst
 from plainmp.experimental import MultiGoalRRT
-from plainmp.ompl_solver import OMPLSolver, OMPLSolverConfig, RefineType
+from plainmp.ompl_solver import (
+    OMPLSolver,
+    OMPLSolverConfig,
+    RefineType,
+    set_random_seed,
+)
 from plainmp.problem import Problem
 from plainmp.psdf import UnionSDF
 from plainmp.robot_spec import (
@@ -163,6 +170,23 @@ class PlanningResult:
 
     def require_repair(self) -> bool:
         return self.base_path_to_pre_remove_chair is not None
+
+    def hash_value(self) -> str:
+        def _hash(obj) -> str:
+            if obj is None:
+                return "None"
+            return hashlib.md5(pickle.dumps(obj)).hexdigest()[:8]
+
+        parts = [
+            _hash(self.joint_path_final),
+            _hash(self.is_rarm),
+            _hash(self.base_path_final),
+            _hash(self.base_path_to_post_remove_chair),
+            _hash(self.base_path_to_pre_remove_chair),
+            _hash(self.remove_chair_idx),
+            _hash(self.chair_rotation_angle),
+        ]
+        return "-".join(parts)
 
 
 class TaskPlanner:
@@ -700,6 +724,9 @@ class SceneVisualizer:
 
 
 if __name__ == "__main__":
+    np.random.seed(1)
+    # set_srand(1)
+    set_random_seed(0)
     task = barely_feasible_task()
     # task = need_fix_task()
     task_planner = TaskPlanner()
