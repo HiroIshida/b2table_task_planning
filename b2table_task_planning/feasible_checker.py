@@ -177,10 +177,10 @@ class PlanningResult:
         return "-".join(parts)
 
 
-class TaskPlanner:
+class CommonResource:
+    engine: FeasibilityChecker
     sampler: SituationSampler
     chair_manager: ChairManager
-    engine: FeasibilityChecker
     table: JskTable
     pr2_pose_lb: np.ndarray
     pr2_pose_ub: np.ndarray
@@ -191,12 +191,20 @@ class TaskPlanner:
         self.engine = FeasibilityChecker()
         self.table = JskTable()
 
+        # define the bound of the pr2 pose
         target_region, _ = JskMessyTableTaskWithChair._prepare_target_region()
         region_lb = target_region.worldpos() - 0.5 * target_region.extents
         region_ub = target_region.worldpos() + 0.5 * target_region.extents
         region_ub[1] += 1.0
         self.pr2_pose_lb = np.hstack([region_lb[:2], [-np.pi * 1.5]])
         self.pr2_pose_ub = np.hstack([region_ub[:2], [+np.pi * 1.5]])
+
+
+class TaskPlanner:
+    common: CommonResource
+
+    def __init__(self):
+        self.common = CommonResource()
 
     def plan(
         self,
@@ -207,16 +215,16 @@ class TaskPlanner:
     ) -> Optional[PlanningResult]:
 
         # check if pr2_pose_now is inside lb and ub
-        if not np.all(pr2_pose_now[:2] > self.pr2_pose_lb[:2]) or not np.all(
-            pr2_pose_now[:2] < self.pr2_pose_ub[:2]
+        if not np.all(pr2_pose_now[:2] > self.common.pr2_pose_lb[:2]) or not np.all(
+            pr2_pose_now[:2] < self.common.pr2_pose_ub[:2]
         ):
             print("pr2_pose_now is out of the bound")
             return None
 
         # here we assume that only chair is movable
-        self.sampler.register_tabletop_obstacles(obstacles_param)
-        self.sampler.register_reaching_pose(reaching_pose)
-        self.chair_manager.set_param(chairs_param)
+        self.common.sampler.register_tabletop_obstacles(obstacles_param)
+        self.common.sampler.register_reaching_pose(reaching_pose)
+        self.common.chair_manager.set_param(chairs_param)
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
             return None  # no solution found
@@ -226,15 +234,11 @@ class TaskPlanner:
 
         if recahable_pr2_poses is None:
             rplanner = RepairPlanner(
+                self.common,
                 pr2_pose_now,
                 pr2_pose_cands,
                 reaching_pose,
-                self.chair_manager,
-                self.engine,
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
                 obstacles_param,
-                self.table,
                 create_map_from_obstacle_param(obstacles_param),
                 current_tree,
             )
@@ -246,20 +250,16 @@ class TaskPlanner:
 
         reaching_pose_tile = np.tile(reaching_pose, (recahable_pr2_poses.shape[0], 1))
         vectors = np.concatenate([recahable_pr2_poses, reaching_pose_tile], axis=1)
-        is_feasibiles, min_indices = self.engine.infer(vectors, table_mat, ground_mat)
+        is_feasibiles, min_indices = self.common.engine.infer(vectors, table_mat, ground_mat)
 
         # check if any feasible solution exists
         if not np.any(is_feasibiles):
             rplanner = RepairPlanner(
+                self.common,
                 pr2_pose_now,
                 pr2_pose_cands,
                 reaching_pose,
-                self.chair_manager,
-                self.engine,
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
                 obstacles_param,
-                self.table,
                 table_mat,
                 current_tree,
             )
@@ -275,7 +275,7 @@ class TaskPlanner:
                 conf.refine_seq = [RefineType.SHORTCUT, RefineType.BSPLINE]
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(task.export_problem())
-                init_traj = self.engine.lib.init_solutions[min_idx]
+                init_traj = self.common.engine.lib.init_solutions[min_idx]
                 res = solver.solve(init_traj)
                 if res.traj is not None:
                     result = PlanningResult()
@@ -292,7 +292,7 @@ class TaskPlanner:
         pose_list = []
         n_sample_pose = 1000  # temp
         for _ in tqdm.tqdm(range(n_sample_pose)):
-            pose = self.sampler.sample_pr2_pose()
+            pose = self.common.sampler.sample_pr2_pose()
             if pose is not None:
                 pose_list.append(pose)
         if len(pose_list) == 0:
@@ -305,8 +305,8 @@ class TaskPlanner:
     ) -> Tuple[Optional[np.ndarray], MultiGoalRRT]:
         # check if robot is placable at the sampled pose.
         # Also, return the tree as a bi-product
-        sdf = self.chair_manager.create_sdf()
-        sdf.merge(self.table.create_sdf())
+        sdf = self.common.chair_manager.create_sdf()
+        sdf.merge(self.common.table.create_sdf())
 
         pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
         skmodel = pr2_spec.get_robot_model(deepcopy=False)
@@ -315,7 +315,9 @@ class TaskPlanner:
         cst = pr2_spec.create_collision_const()
         cst.set_sdf(sdf)
 
-        tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 2000)
+        tree = MultiGoalRRT(
+            current_pose, self.common.pr2_pose_lb, self.common.pr2_pose_ub, cst, 2000
+        )
         bools = tree.is_reachable_batch(pose_list.T, 0.5)
         if not np.any(bools):
             return None, tree
@@ -350,15 +352,11 @@ _BASE_SPEC, _COLLISION_CST_BASE_ONLY, _COLLISION_CST_WITH_CHAIR = setup_spec_and
 
 
 class RepairPlanner:
+    common: CommonResource
     init_pr2_pose: np.ndarray
     final_pr2_pose_cands: np.ndarray
     final_gripper_pose: np.ndarray
-    chair_manager: ChairManager
-    engine: FeasibilityChecker
-    pr2_pose_lb: np.ndarray
-    pr2_pose_ub: np.ndarray
     obstacle_param: np.ndarray
-    table: JskTable
     table_mat: np.ndarray  # heightmap of the table (can be genrated from obstacle_param but we cache it)
     tree_current: MultiGoalRRT
     base_spec: PR2BaseOnlySpec
@@ -367,27 +365,19 @@ class RepairPlanner:
 
     def __init__(
         self,
+        common: CommonResource,
         init_pr2_pose: np.ndarray,
         final_pr2_pose_cands: np.ndarray,
         final_gripper_pose: np.ndarray,
-        chair_manager: ChairManager,
-        engine: FeasibilityChecker,
-        pr2_pose_lb: np.ndarray,
-        pr2_pose_ub: np.ndarray,
         obstacle_param: np.ndarray,
-        table: JskTable,
         table_mat: np.ndarray,
         tree_current: MultiGoalRRT,
     ):
+        self.common = common
         self.init_pr2_pose = init_pr2_pose
         self.final_pr2_pose_cands = final_pr2_pose_cands
         self.final_gripper_pose = final_gripper_pose
-        self.chair_manager = chair_manager
-        self.engine = engine
-        self.pr2_pose_lb = pr2_pose_lb
-        self.pr2_pose_ub = pr2_pose_ub
         self.obstacle_param = obstacle_param
-        self.table = table
         self.table_mat = table_mat
         self.tree_current = tree_current
 
@@ -403,9 +393,9 @@ class RepairPlanner:
             chairs_param_hypo = np.delete(
                 chairs_param_original, np.s_[3 * i_chair : 3 * i_chair + 3]
             )
-            self.chair_manager.set_param(chairs_param_hypo)
-            sdf_hypo = self.chair_manager.create_sdf()
-            sdf_hypo.merge(self.table.create_sdf())
+            self.common.chair_manager.set_param(chairs_param_hypo)
+            sdf_hypo = self.common.chair_manager.create_sdf()
+            sdf_hypo.merge(self.common.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf_hypo)
 
             planning_result = PlanningResult()
@@ -414,8 +404,8 @@ class RepairPlanner:
             # first check if the robot base can reach the goal
             tree_completely_removed = MultiGoalRRT(
                 self.init_pr2_pose,
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
+                self.common.pr2_pose_lb,
+                self.common.pr2_pose_ub,
                 self.collision_cst_base_only,
                 2000,
             )
@@ -431,7 +421,9 @@ class RepairPlanner:
             ground_mat = create_map_from_chair_param(chairs_param_hypo)
             gripper_pose_tile = np.tile(self.final_gripper_pose, (reachable_poses.shape[0], 1))
             vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
-            is_feasibiles, min_indices = self.engine.infer(vectors, self.table_mat, ground_mat)
+            is_feasibiles, min_indices = self.common.engine.infer(
+                vectors, self.table_mat, ground_mat
+            )
             if not np.any(is_feasibiles):
                 print(
                     f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair"
@@ -462,7 +454,7 @@ class RepairPlanner:
                 )
                 solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
                 solver.setup(reaching_task.export_problem())
-                init_traj = self.engine.lib.init_solutions[min_idx]
+                init_traj = self.common.engine.lib.init_solutions[min_idx]
                 res = solver.solve(init_traj)
                 if res.traj is None:
                     continue
@@ -486,8 +478,8 @@ class RepairPlanner:
             self.base_spec.reflect_skrobot_model_to_kin(pr2_model)
             tree_chair_attach = MultiGoalRRT(
                 pre_remove_pr2_pose,
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
+                self.common.pr2_pose_lb,
+                self.common.pr2_pose_ub,
                 self.collision_cst_with_chair,
                 2000,
             )
@@ -513,8 +505,8 @@ class RepairPlanner:
                         0.0,
                     ]
                 )
-                self.chair_manager.set_param(chair_pose)
-                sdf_single_chair = self.chair_manager.create_sdf()
+                self.common.chair_manager.set_param(chair_pose)
+                sdf_single_chair = self.common.chair_manager.create_sdf()
                 self.collision_cst_base_only.set_sdf(sdf_single_chair)
                 is_collision_free = np.all(
                     [self.collision_cst_base_only.is_valid(q) for q in traj.numpy()]
@@ -533,9 +525,9 @@ class RepairPlanner:
 
             # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
             chairs_param_post_remove = np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
-            self.chair_manager.set_param(chairs_param_post_remove)
-            sdf_post_remove = self.chair_manager.create_sdf()
-            sdf_post_remove.merge(self.table.create_sdf())
+            self.common.chair_manager.set_param(chairs_param_post_remove)
+            sdf_post_remove = self.common.chair_manager.create_sdf()
+            sdf_post_remove.merge(self.common.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf_post_remove)
 
             # assert self.collision_cst_base_only.is_valid(post_remove_pr2_pose)
@@ -553,8 +545,8 @@ class RepairPlanner:
             solver = OMPLSolver(ompl_solver_config)
             problem = Problem(
                 post_remove_pr2_pose,
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
+                self.common.pr2_pose_lb,
+                self.common.pr2_pose_ub,
                 pr2_final_pose,
                 self.collision_cst_base_only,
                 None,
@@ -565,16 +557,16 @@ class RepairPlanner:
 
             # optionally? smooth result of the base_path_to_pre_remove_chair
             self.collision_cst_base_only.set_sdf(sdf_hypo)
-            self.chair_manager.set_param(chairs_param_original)
-            sdf_original = self.chair_manager.create_sdf()
-            sdf_original.merge(self.table.create_sdf())
+            self.common.chair_manager.set_param(chairs_param_original)
+            sdf_original = self.common.chair_manager.create_sdf()
+            sdf_original.merge(self.common.table.create_sdf())
             self.collision_cst_base_only.set_sdf(sdf_original)
             solver = OMPLSolver(ompl_solver_config)
 
             problem = Problem(
                 planning_result.base_path_to_pre_remove_chair[0],
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
+                self.common.pr2_pose_lb,
+                self.common.pr2_pose_ub,
                 planning_result.base_path_to_pre_remove_chair[-1],
                 self.collision_cst_base_only,
                 None,
@@ -593,8 +585,8 @@ class RepairPlanner:
             solver = OMPLSolver(ompl_solver_config)
             problem = Problem(
                 planning_result.base_path_to_post_remove_chair[0],
-                self.pr2_pose_lb,
-                self.pr2_pose_ub,
+                self.common.pr2_pose_lb,
+                self.common.pr2_pose_ub,
                 planning_result.base_path_to_post_remove_chair[-1],
                 self.collision_cst_with_chair,
                 None,
