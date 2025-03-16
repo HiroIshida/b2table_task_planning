@@ -147,18 +147,6 @@ class FeasibilityChecker:
 
 
 @dataclass
-class TaskPlannerConfig:
-    n_sample_pose: int = 1000
-
-
-@dataclass
-class TaskAndMotionPlan:
-    pr2_pose: np.ndarray
-    traj: Trajectory
-    rarm: bool
-
-
-@dataclass
 class PlanningResult:
     joint_path_final: Optional[Trajectory] = None
     is_rarm: Optional[bool] = None
@@ -193,16 +181,14 @@ class TaskPlanner:
     sampler: SituationSampler
     chair_manager: ChairManager
     engine: FeasibilityChecker
-    config: TaskPlannerConfig
     table: JskTable
     pr2_pose_lb: np.ndarray
     pr2_pose_ub: np.ndarray
 
-    def __init__(self, config: TaskPlannerConfig = TaskPlannerConfig()):
+    def __init__(self):
         self.sampler = SituationSampler()
         self.chair_manager = ChairManager()
         self.engine = FeasibilityChecker()
-        self.config = config
         self.table = JskTable()
 
         target_region, _ = JskMessyTableTaskWithChair._prepare_target_region()
@@ -304,7 +290,8 @@ class TaskPlanner:
 
     def _sample_pr2_pose(self) -> Optional[np.ndarray]:
         pose_list = []
-        for _ in tqdm.tqdm(range(self.config.n_sample_pose)):
+        n_sample_pose = 1000  # temp
+        for _ in tqdm.tqdm(range(n_sample_pose)):
             pose = self.sampler.sample_pr2_pose()
             if pose is not None:
                 pose_list.append(pose)
