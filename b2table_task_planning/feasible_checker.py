@@ -38,7 +38,7 @@ from rpbench.articulated.pr2.thesis_jsk_table import (
 from rpbench.articulated.vision import create_heightmap_z_slice
 from rpbench.articulated.world.utils import BoxSkeleton
 from skrobot.coordinates import Coordinates
-from skrobot.model import Axis
+from skrobot.model import Axis, RobotModel
 from skrobot.models.pr2 import PR2
 from skrobot.viewers import PyrenderViewer
 
@@ -185,6 +185,7 @@ class CommonResource:
     pr2_pose_lb: np.ndarray
     pr2_pose_ub: np.ndarray
     base_spec: PR2BaseOnlySpec
+    pr2_model: RobotModel
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
 
@@ -205,6 +206,7 @@ class CommonResource:
         # prepare spec
         base_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
         self.base_spec = base_spec
+        self.pr2_model = base_spec.get_robot_model(deepcopy=False)
 
         # prepare collision constraint
         skmodel = base_spec.get_robot_model(deepcopy=False)
@@ -460,9 +462,8 @@ class RepairPlanner:
             traj = Trajectory(path).resample(100)
 
             self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
-            pr2_model = self.common.base_spec.get_robot_model(deepcopy=False)
-            pr2_model.angle_vector(AV_CHAIR_GRASP)
-            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)
+            self.common.pr2_model.angle_vector(AV_CHAIR_GRASP)
+            self.common.base_spec.reflect_skrobot_model_to_kin(self.common.pr2_model)
             tree_chair_attach = MultiGoalRRT(
                 pre_remove_pr2_pose,
                 self.common.pr2_pose_lb,
@@ -470,8 +471,10 @@ class RepairPlanner:
                 self.common.collision_cst_with_chair,
                 2000,
             )
-            pr2_model.angle_vector(AV_INIT)
-            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)  # reset the kin model
+            self.common.pr2_model.angle_vector(AV_INIT)
+            self.common.base_spec.reflect_skrobot_model_to_kin(
+                self.common.pr2_model
+            )  # reset the kin model
             nodes = tree_chair_attach.get_debug_states()
             dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
             sorted_indices = np.argsort(dists)
@@ -562,8 +565,8 @@ class RepairPlanner:
 
             # optionally? smooth result of the base_path_to_post_remove_chair
             self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
-            pr2_model.angle_vector(AV_CHAIR_GRASP)
-            self.common.base_spec.reflect_skrobot_model_to_kin(pr2_model)
+            self.common.pr2_model.angle_vector(AV_CHAIR_GRASP)
+            self.common.base_spec.reflect_skrobot_model_to_kin(self.common.pr2_model)
 
             # for q in planning_result.base_path_to_post_remove_chair:
             solver = OMPLSolver(ompl_solver_config)
