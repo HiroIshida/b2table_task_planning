@@ -446,61 +446,17 @@ class RepairPlanner:
             feasible_pr2_final_pose = planning_result.base_path_final[-1]
 
             # check if feasible placment of the chair is possible
-            path = tree_hypo.get_solution(feasible_pr2_final_pose).T
-            traj = Trajectory(path).resample(100)
-
-            tree_chair_attach = self.common.build_base_motion_tree(
-                planning_result.base_path_to_pre_remove_chair[-1], sdf_hypo, grasping_chair=True
-            )
-
-            self.common.pr2_model.angle_vector(AV_INIT)
-            self.common.base_spec.reflect_skrobot_model_to_kin(
-                self.common.pr2_model
-            )  # reset the kin model
-            nodes = tree_chair_attach.get_debug_states()
-            dists = np.linalg.norm(nodes[:, :2] - path[-1, :2], axis=1)
-            sorted_indices = np.argsort(dists)
-
-            valid_post_remove_pr2_pose = None
-            valid_post_remove_chair_pose = None
-            for ind in sorted_indices:
-                post_remove_pr2_pose = nodes[ind]
-                # check if post_remove_pr2_pose is collision free (this is required because we only know that this position is collision free at the grasping pose)
-                self.common.collision_cst_base_only.set_sdf(sdf_hypo)
-                if not self.common.collision_cst_base_only.is_valid(post_remove_pr2_pose):
-                    continue
-
-                chair_pose = post_remove_pr2_pose + np.array(
-                    [
-                        CHAIR_GRASP_BASE_OFFSET * np.cos(post_remove_pr2_pose[2]),
-                        CHAIR_GRASP_BASE_OFFSET * np.sin(post_remove_pr2_pose[2]),
-                        0.0,
-                    ]
-                )
-                self.common.chair_manager.set_param(chair_pose)
-                sdf_single_chair = self.common.chair_manager.create_sdf()
-                self.common.collision_cst_base_only.set_sdf(sdf_single_chair)
-                is_collision_free = np.all(
-                    [self.common.collision_cst_base_only.is_valid(q) for q in traj.numpy()]
-                )
-                if not is_collision_free:
-                    continue
-                valid_post_remove_pr2_pose = post_remove_pr2_pose
-                valid_post_remove_chair_pose = chair_pose
-                break
-            if valid_post_remove_pr2_pose is None:
-                print(f"giving up the chair {i_chair} because the chair placement is not feasible")
+            success = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
+            if not success:
                 continue
-            planning_result.base_path_to_post_remove_chair = Trajectory(
-                tree_chair_attach.get_solution(valid_post_remove_pr2_pose).T
-            )
+            valid_post_remove_chair_pose = planning_result.tmp  # FIXME: this is temporary
 
             # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
             sdf_post_remove = self.common.create_sdf_table_and_chairs(
                 np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
             )
             planning_result.base_path_final = self.common.solve_base_motion_planning(
-                valid_post_remove_pr2_pose,
+                planning_result.base_path_to_post_remove_chair[-1],
                 feasible_pr2_final_pose,
                 sdf_post_remove,
                 grasping_chair=False,
@@ -604,6 +560,59 @@ class RepairPlanner:
 
         # NOTE: this path is temporary and will be replaced by the actual path
         result.base_path_final = Trajectory(tree_hypo.get_solution(feasible_pr2_final_pose).T)
+        return True
+
+    def plan_base_motion_move_chair(self, sdf_hypo: UnionSDF, result: PlanningResult) -> bool:
+        assert result.base_path_final is not None
+        base_final_path_tentative = result.base_path_final.resample(100).numpy()
+
+        assert result.base_path_to_pre_remove_chair is not None
+        tree_chair_attach = self.common.build_base_motion_tree(
+            result.base_path_to_pre_remove_chair[-1], sdf_hypo, grasping_chair=True
+        )
+
+        self.common.pr2_model.angle_vector(AV_INIT)
+        self.common.base_spec.reflect_skrobot_model_to_kin(
+            self.common.pr2_model
+        )  # reset the kin model
+        nodes = tree_chair_attach.get_debug_states()
+        dists = np.linalg.norm(nodes[:, :2] - base_final_path_tentative[-1, :2], axis=1)
+        sorted_indices = np.argsort(dists)
+
+        valid_post_remove_pr2_pose = None
+        valid_post_remove_chair_pose = None
+        for ind in sorted_indices:
+            post_remove_pr2_pose = nodes[ind]
+            # check if post_remove_pr2_pose is collision free (this is required because we only know that this position is collision free at the grasping pose)
+            self.common.collision_cst_base_only.set_sdf(sdf_hypo)
+            if not self.common.collision_cst_base_only.is_valid(post_remove_pr2_pose):
+                continue
+
+            chair_pose = post_remove_pr2_pose + np.array(
+                [
+                    CHAIR_GRASP_BASE_OFFSET * np.cos(post_remove_pr2_pose[2]),
+                    CHAIR_GRASP_BASE_OFFSET * np.sin(post_remove_pr2_pose[2]),
+                    0.0,
+                ]
+            )
+            self.common.chair_manager.set_param(chair_pose)
+            sdf_single_chair = self.common.chair_manager.create_sdf()
+            self.common.collision_cst_base_only.set_sdf(sdf_single_chair)
+            is_collision_free = np.all(
+                [self.common.collision_cst_base_only.is_valid(q) for q in base_final_path_tentative]
+            )
+            if not is_collision_free:
+                continue
+            valid_post_remove_pr2_pose = post_remove_pr2_pose
+            valid_post_remove_chair_pose = chair_pose
+            break
+        if valid_post_remove_pr2_pose is None:
+            print("no feasible solution found")
+            return False
+        result.base_path_to_post_remove_chair = Trajectory(
+            tree_chair_attach.get_solution(valid_post_remove_pr2_pose).T
+        )
+        result.tmp = valid_post_remove_chair_pose
         return True
 
 
