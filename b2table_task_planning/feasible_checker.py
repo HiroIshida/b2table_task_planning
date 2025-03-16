@@ -399,65 +399,23 @@ class RepairPlanner:
                 continue
 
             # first check if the robot base can reach the goal
-            tree_completely_removed = MultiGoalRRT(
+            tree_hypo = MultiGoalRRT(
                 self.problem.pr2_pose_now,
                 self.common.pr2_pose_lb,
                 self.common.pr2_pose_ub,
                 self.common.collision_cst_base_only,
                 2000,
             )
-            bools = tree_completely_removed.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
-            reachable_poses = self.final_pr2_pose_cands[bools]
-            if len(reachable_poses) == 0:
-                print(
-                    f"giving up the chair {i_chair} because no feasible base pose found even after completely removing the chair"
-                )
-                continue
 
-            # check if the robot arm can reach the goal pose
-            ground_mat = create_map_from_chair_param(chairs_param_hypo)
-            gripper_pose_tile = np.tile(self.problem.reaching_pose, (reachable_poses.shape[0], 1))
-            vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
-            is_feasibiles, min_indices = self.common.engine.infer(
-                vectors, self.table_mat, ground_mat
+            success = self.plan_base_and_arm_hypo_removed(
+                tree_hypo, chairs_param_hypo, chair_pose_remove, planning_result
             )
-            if not np.any(is_feasibiles):
-                print(
-                    f"giving up the chair {i_chair} because the arm planning is not feasible even after completely removing the chair"
-                )
+            if not success:
                 continue
-
-            # check if the detected situation is feasible by actually solving the problem
-            feasible_pr2_final_pose = None
-            for pr2_final_pose, is_feasible, min_idx in zip(
-                reachable_poses, is_feasibiles, min_indices
-            ):
-                if not is_feasible:
-                    continue
-                reaching_task = JskMessyTableTaskWithChair(
-                    self.problem.obstacles_param,
-                    chairs_param_hypo,
-                    pr2_final_pose,
-                    self.problem.reaching_pose,
-                )
-                solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
-                solver.setup(reaching_task.export_problem())
-                init_traj = self.common.engine.lib.init_solutions[min_idx]
-                res = solver.solve(init_traj)
-                if res.traj is None:
-                    continue
-                feasible_pr2_final_pose = pr2_final_pose
-                planning_result.joint_path_final = res.traj
-                planning_result.is_rarm = reaching_task.is_using_rarm()
-                break
-            if feasible_pr2_final_pose is None:
-                print(
-                    f"giving up the chair {i_chair} because the arm planning is not 'actually' feasible even after completely removing the chair"
-                )
-                continue
+            feasible_pr2_final_pose = planning_result.base_path_final[-1]
 
             # check if feasible placment of the chair is possible
-            path = tree_completely_removed.get_solution(feasible_pr2_final_pose).T
+            path = tree_hypo.get_solution(feasible_pr2_final_pose).T
             traj = Trajectory(path).resample(100)
 
             self.common.collision_cst_with_chair.set_sdf(sdf_hypo)
@@ -608,6 +566,57 @@ class RepairPlanner:
         result.chair_rotation_angle = yaw_rotate
 
         result.base_path_to_pre_remove_chair = Trajectory(tree.get_solution(pre_grasp_base_pose).T)
+        return True
+
+    def plan_base_and_arm_hypo_removed(
+        self,
+        tree_hypo: MultiGoalRRT,
+        chairs_param_hypo: np.ndarray,
+        chair_pose: np.ndarray,
+        result: PlanningResult,
+    ) -> bool:
+        bools = tree_hypo.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
+        reachable_poses = self.final_pr2_pose_cands[bools]
+        if len(reachable_poses) == 0:
+            print("no feasible base pose found even after completely removing the chair")
+            return False
+
+        ground_mat = create_map_from_chair_param(chairs_param_hypo)
+        gripper_pose_tile = np.tile(self.problem.reaching_pose, (reachable_poses.shape[0], 1))
+        vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
+        is_feasibiles, min_indices = self.common.engine.infer(vectors, self.table_mat, ground_mat)
+        if not np.any(is_feasibiles):
+            print("the arm planning is not feasible even after completely removing the chair")
+            return False
+
+        feasible_pr2_final_pose = None
+        for pr2_final_pose, is_feasible, min_idx in zip(
+            reachable_poses, is_feasibiles, min_indices
+        ):
+            if not is_feasible:
+                continue
+            reaching_task = JskMessyTableTaskWithChair(
+                self.problem.obstacles_param,
+                chairs_param_hypo,
+                pr2_final_pose,
+                self.problem.reaching_pose,
+            )
+            solver = Pr2ThesisJskTable2.solver_type.init(Pr2ThesisJskTable2.solver_config)
+            solver.setup(reaching_task.export_problem())
+            init_traj = self.common.engine.lib.init_solutions[min_idx]
+            res = solver.solve(init_traj)
+            if res.traj is None:
+                continue
+            feasible_pr2_final_pose = pr2_final_pose
+            result.joint_path_final = res.traj
+            result.is_rarm = reaching_task.is_using_rarm()
+            break
+        if feasible_pr2_final_pose is None:
+            print("no feasible solution found")
+            return False
+
+        # NOTE: this path is temporary and will be replaced by the actual path
+        result.base_path_final = Trajectory(tree_hypo.get_solution(feasible_pr2_final_pose).T)
         return True
 
 
