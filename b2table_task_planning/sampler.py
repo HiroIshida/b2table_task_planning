@@ -1,24 +1,21 @@
 from typing import Optional
 
 import numpy as np
-from plainmp.constraint import SphereCollisionCst
 from plainmp.psdf import BoxSDF, Pose, UnionSDF
 from plainmp.robot_spec import PR2BaseOnlySpec
 from rpbench.articulated.pr2.thesis_jsk_table import (
     AV_INIT,
     JskMessyTableTask,
     JskTable,
-    fit_radian,
 )
 from rpbench.articulated.world.utils import BoxSkeleton
 from rpbench.planer_box_utils import Box2d, PlanerCoords
 
-from b2table_task_planning.cython import compute_box2d_sd
+from b2table_task_planning.cpp.sample_pr2_pose import create_sampler, sample_pose
 
 
 class SituationSampler:
     table2d_box: Box2d  # to compute 2d sdf of the table
-    table_collision_cst: SphereCollisionCst
     target_region: BoxSkeleton  # contains all robot, table, and chairs
     tabletop_obstacle_sdf: Optional[UnionSDF]
     reaching_pose: Optional[np.ndarray]
@@ -44,11 +41,31 @@ class SituationSampler:
         cst = pr2_spec.create_collision_const()
         sdf = JskTable().create_sdf()
         cst.set_sdf(sdf)
-        self.cst = cst
 
         # target region
         target_region, table_box2d_wrt_region = JskMessyTableTask._prepare_target_region()
         self.target_region = target_region
+
+        def make_func():
+            arr = np.zeros(3)
+
+            def func(x):
+                arr[0] = x[0]
+                arr[1] = x[1]
+                arr[2] = x[2]
+                return cst.is_valid(arr)
+
+            return func
+
+        func = make_func()
+        self.sampler = create_sampler(
+            target_region.extents[:2],
+            target_region.worldpos()[:2],
+            table2d_box.extent[:2],
+            table2d_box.coords.pos,
+            func,
+            0,
+        )
 
         self.tabletop_obstacle_sdf = None
         self.reaching_pose = None
@@ -107,21 +124,4 @@ class SituationSampler:
         return True
 
     def sample_pr2_pose(self, n_max_trial: int = 100) -> Optional[np.ndarray]:
-        points = self.target_region.sample_points(n_max_trial)
-
-        dists = np.linalg.norm(points[:, :2] - self.reaching_pose[:2], axis=1)
-        points_inside = points[dists < 0.8][:, :2]
-        yaw_pluss = np.random.uniform(-np.pi / 4, np.pi / 4, size=(len(points_inside), 1))
-        yaw_cands = fit_radian(self.reaching_pose[3] + yaw_pluss)
-        vector_coords = np.hstack([points_inside, yaw_cands])
-
-        for vector in vector_coords:
-            point = vector[:2]
-            sd = compute_box2d_sd(
-                point.reshape(1, 2), self.table2d_box.extent, self.table2d_box.coords.pos
-            )[0]
-            if sd > 0.55 or sd < 0.0:
-                continue
-            if self.cst.is_valid(vector):
-                return vector
-        return None
+        return sample_pose(self.sampler, self.reaching_pose)

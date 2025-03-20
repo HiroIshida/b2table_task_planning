@@ -7,7 +7,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-import tqdm
 from hifuku.core import SolutionLibrary
 from hifuku.domain import Pr2ThesisJskTable2
 from hifuku.script_utils import load_library
@@ -423,7 +422,7 @@ class TaskPlanner:
     def _sample_pr2_pose(self) -> Optional[np.ndarray]:
         pose_list = []
         n_sample_pose = 1000  # temp
-        for _ in tqdm.tqdm(range(n_sample_pose)):
+        for _ in range(n_sample_pose):
             pose = self.common.sampler.sample_pr2_pose()
             if pose is not None:
                 pose_list.append(pose)
