@@ -146,6 +146,47 @@ class FeasibilityChecker:
         )
 
 
+class FeasibilityCheckerJit:
+    lib: SolutionLibrary
+
+    def __init__(self, n_batch: int):
+        self.lib = load_library(Pr2ThesisJskTable2, "cuda", postfix="0.2")
+        self.lib.jit_compile(True, n_batch)
+        self.dummy_vector = torch.zeros(n_batch, 7).float().cuda()
+        self.biases = torch.Tensor(self.lib.biases).float().cuda()
+
+        # warm up
+        vectors = np.random.randn(1, 7).astype(np.float32)
+        table_mat = np.random.randn(112, 112).astype(np.float32)
+        ground_mat = np.random.randn(112, 112).astype(np.float32)
+        for _ in range(10):
+            self.infer(vectors, table_mat, ground_mat)
+
+    def infer(self, vectors: np.ndarray, table_mat: np.ndarray, ground_mat: np.ndarray):
+        vectors = torch.from_numpy(vectors).float().cuda()
+        table_mat = torch.from_numpy(table_mat).float().cuda()  # 112 x 112
+        ground_mat = torch.from_numpy(ground_mat).float().cuda()  # 112 x 112
+
+        # first pass the CNN model
+        mat = torch.stack([table_mat, ground_mat], dim=0).unsqueeze(0)
+        encoded = self.lib.ae_model_shared.forward(mat)
+
+        # then FCN
+        n_vector = vectors.shape[0]
+        self.dummy_vector[:n_vector] = vectors
+        encoded.repeat(self.dummy_vector.shape[0], 1)
+
+        costs = self.lib.batch_predictor(encoded, self.dummy_vector)
+        cost_calibrated = costs[:n_vector] + self.biases
+        # cost_calibrated has (n_batch, n_predictor)
+        # now for each inference among the btach we take fthe minimum cost of predictor output
+        min_costs, min_indices = torch.min(cost_calibrated, dim=1)
+        return (
+            min_costs.cpu().detach().numpy() < self.lib.max_admissible_cost,
+            min_indices.cpu().detach().numpy(),
+        )
+
+
 @dataclass
 class PlanningResult:
     joint_path_final: Optional[Trajectory] = None
