@@ -123,6 +123,7 @@ class FeasibilityChecker:
             self.lib.infer(task)
 
     def infer(self, vectors: np.ndarray, table_mat: np.ndarray, ground_mat: np.ndarray):
+        print(f"num vector {len(vectors)}")
         vectors = torch.from_numpy(vectors).float().cuda()
         table_mat = torch.from_numpy(table_mat).float().cuda()  # 112 x 112
         ground_mat = torch.from_numpy(ground_mat).float().cuda()  # 112 x 112
@@ -163,6 +164,7 @@ class FeasibilityCheckerJit:
             self.infer(vectors, table_mat, ground_mat)
 
     def infer(self, vectors: np.ndarray, table_mat: np.ndarray, ground_mat: np.ndarray):
+        print(f"num vector {len(vectors)}")
         vectors = torch.from_numpy(vectors).float().cuda()
         table_mat = torch.from_numpy(table_mat).float().cuda()  # 112 x 112
         ground_mat = torch.from_numpy(ground_mat).float().cuda()  # 112 x 112
@@ -233,7 +235,7 @@ class CommonResource:
     def __init__(self):
         self.sampler = SituationSampler()
         self.chair_manager = ChairManager()
-        self.engine = FeasibilityChecker()
+        self.engine = FeasibilityCheckerJit(1000)
         self.table = JskTable()
 
         # define the bound of the pr2 pose
@@ -294,7 +296,6 @@ class CommonResource:
         ompl_solver_config = OMPLSolverConfig(
             refine_seq=[
                 RefineType.SHORTCUT,
-                RefineType.BSPLINE,
                 RefineType.SHORTCUT,
                 RefineType.BSPLINE,
             ]
@@ -458,6 +459,7 @@ class RepairPlanner:
 
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
+            print(f"trying hypothetical repair for chair {i_chair}")
             chair_pose_remove = chairs_param_original[i_chair * 3 : (i_chair + 1) * 3]
             chairs_param_hypo = np.delete(
                 chairs_param_original, np.s_[3 * i_chair : 3 * i_chair + 3]
@@ -639,11 +641,15 @@ class RepairPlanner:
             self.common.chair_manager.set_param(chair_pose)
             sdf_single_chair = self.common.chair_manager.create_sdf()
             self.common.collision_cst_base_only.set_sdf(sdf_single_chair)
-            is_collision_free = np.all(
-                [self.common.collision_cst_base_only.is_valid(q) for q in base_final_path_tentative]
-            )
+
+            is_collision_free = True
+            for q in base_final_path_tentative:
+                if not self.common.collision_cst_base_only.is_valid(q):
+                    is_collision_free = False
+                    break
             if not is_collision_free:
                 continue
+
             valid_post_remove_pr2_pose = post_remove_pr2_pose
             valid_post_remove_chair_pose = chair_pose
             break
