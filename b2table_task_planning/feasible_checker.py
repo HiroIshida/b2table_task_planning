@@ -733,6 +733,16 @@ class RepairPlanner:
         result.tmp = valid_post_remove_chair_pose
         return SubProblemStatus.SUCCESS
 
+    @staticmethod
+    def split_chair_param(
+        chairs_param: np.ndarray, i_chair_remove: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        chair_pose_remove = chairs_param[i_chair_remove * 3 : (i_chair_remove + 1) * 3]
+        chairs_param_hypo = np.delete(
+            chairs_param, np.s_[3 * i_chair_remove : 3 * i_chair_remove + 3]
+        )
+        return chair_pose_remove, chairs_param_hypo
+
 
 class SceneVisualizer:
     def __init__(self, init_pr2_pose, final_gripper_pose: np.ndarray, chairs_param: np.ndarray):
