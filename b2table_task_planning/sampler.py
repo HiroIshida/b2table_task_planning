@@ -10,6 +10,7 @@ from rpbench.articulated.pr2.thesis_jsk_table import (
 )
 from rpbench.articulated.world.utils import BoxSkeleton
 from rpbench.planer_box_utils import Box2d, PlanerCoords
+from skrobot.model.robot_model import RobotModel
 
 from b2table_task_planning.cpp.sample_pr2_pose import create_sampler, sample_pose
 
@@ -19,6 +20,7 @@ class SituationSampler:
     target_region: BoxSkeleton  # contains all robot, table, and chairs
     tabletop_obstacle_sdf: Optional[UnionSDF]
     reaching_pose: Optional[np.ndarray]
+    _skmodel: RobotModel
 
     def __init__(self):
         co2d = PlanerCoords(
@@ -31,12 +33,7 @@ class SituationSampler:
 
         # setup kin model
         pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
-        pr2_spec.get_kin()
-        skmodel = pr2_spec.get_robot_model()
-        skmodel.angle_vector(AV_INIT)
-        pr2_spec.reflect_skrobot_model_to_kin(
-            skmodel
-        )  # NOTE: robot configuration expect for base is fixed
+        self.reset_kinematics_state()
 
         cst = pr2_spec.create_collision_const()
         sdf = JskTable().create_sdf()
@@ -69,6 +66,17 @@ class SituationSampler:
 
         self.tabletop_obstacle_sdf = None
         self.reaching_pose = None
+
+    def reset_kinematics_state(self):
+        pr2_spec = PR2BaseOnlySpec(use_fixed_uuid=True)
+        skmodel = pr2_spec.get_robot_model(deepcopy=False)
+        skmodel.angle_vector(AV_INIT)
+        pr2_spec.reflect_skrobot_model_to_kin(
+            skmodel
+        )  # NOTE: robot configuration expect for base is fixed
+        cst = pr2_spec.create_collision_const()
+        sdf = JskTable().create_sdf()
+        cst.set_sdf(sdf)
 
     def register_tabletop_obstacles(self, obstacles_param: np.ndarray) -> bool:
         n_obstacle = int(len(obstacles_param) / 6)  # x, y, yaw, d, w, h

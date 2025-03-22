@@ -421,6 +421,7 @@ class TaskPlanner:
         ), "not supposed to reach here, but there is still very small chance to reach here..."
 
     def _sample_pr2_pose(self) -> Optional[np.ndarray]:
+        self.common.sampler.reset_kinematics_state()
         pose_list = []
         n_sample_pose = 1000  # temp
         for _ in range(n_sample_pose):
