@@ -3,7 +3,8 @@ import hashlib
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Optional
+from enum import Enum
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -432,6 +433,18 @@ class TaskPlanner:
         return pose_list
 
 
+class SubProblemStatus(Enum):
+    SUCCESS: str = "success"
+    NO_REACHABLE_PRE_GRASP_BASE_POSE: str = "no reachable pre-grasp base pose"
+    NO_REACHEBLE_FINAL_BASE_POSE: str = "no reachable final base pose"
+    NO_FEASIBLE_ARM_PLAN: str = "no feasible arm plan"
+    NO_FEAIBLE_CHAIR_PLACEMENT: str = "no feasible chair placement"
+
+    @property
+    def is_success(self) -> bool:
+        return self == SubProblemStatus.SUCCESS
+
+
 class RepairPlanner:
     common: CommonResource
     problem: PlanningProblem
@@ -458,14 +471,14 @@ class RepairPlanner:
 
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
-            result = self.plan_single(chairs_param_original, i_chair)
+            result, status = self.plan_single(chairs_param_original, i_chair)
             if result is not None:
                 return result
         return None
 
     def plan_single(
         self, chairs_param_now: np.ndarray, remove_chair_idx: int
-    ) -> Optional[PlanningResult]:
+    ) -> Tuple[Optional[PlanningResult], SubProblemStatus]:
         print(f"trying hypothetical repair for chair {remove_chair_idx}")
         chair_pose_remove = chairs_param_now[remove_chair_idx * 3 : (remove_chair_idx + 1) * 3]
         chairs_param_hypo = np.delete(
@@ -475,11 +488,11 @@ class RepairPlanner:
         planning_result.remove_chair_idx = remove_chair_idx
 
         # check if i_chair can be graspable
-        success = self.plan_base_motion_to_chair_grasp_pose(
+        status = self.plan_base_motion_to_chair_grasp_pose(
             chair_pose_remove, self.tree_current, planning_result
         )
-        if not success:
-            return None
+        if not status.is_success:
+            return None, status
 
         # build tree for the hypothetical environment
         sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
@@ -488,17 +501,17 @@ class RepairPlanner:
         )
 
         # check if plan is feasible after removing the chair
-        success = self.plan_base_and_arm_hypo_removed(
+        status = self.plan_base_and_arm_hypo_removed(
             tree_hypo, chairs_param_hypo, chair_pose_remove, planning_result
         )
-        if not success:
-            return None
+        if not status.is_success:
+            return None, status
         feasible_pr2_final_pose = planning_result.base_path_final[-1]
 
         # check if feasible placment of the chair is possible
-        success = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
-        if not success:
-            return None
+        status = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
+        if not status.is_success:
+            return None, status
         valid_post_remove_chair_pose = planning_result.tmp  # FIXME: this is temporary
 
         # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
@@ -526,11 +539,11 @@ class RepairPlanner:
             sdf_hypo,
             grasping_chair=True,
         )
-        return planning_result
+        return planning_result, SubProblemStatus.SUCCESS
 
     def plan_base_motion_to_chair_grasp_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT, result: PlanningResult
-    ) -> bool:
+    ) -> SubProblemStatus:
 
         # check if blocking chair is actually removable by
         # hypothetically chaing the chair yaw angles
@@ -546,8 +559,7 @@ class RepairPlanner:
         pr2_pose_pre_grasp_cands = np.array([xs, ys, yaw_cands]).T
         bools = tree.is_reachable_batch(pr2_pose_pre_grasp_cands.T, 0.5)
         if not np.any(bools):
-            print("no reachable pre-grasp base pose found")
-            return False
+            return SubProblemStatus.NO_REACHABLE_PRE_GRASP_BASE_POSE
 
         min_yaw = yaw_cands[bools].min()
         x = x - CHAIR_GRASP_BASE_OFFSET * np.cos(min_yaw)
@@ -557,7 +569,7 @@ class RepairPlanner:
         result.chair_rotation_angle = yaw_rotate
 
         result.base_path_to_pre_remove_chair = Trajectory(tree.get_solution(pre_grasp_base_pose).T)
-        return True
+        return SubProblemStatus.SUCCESS
 
     def plan_base_and_arm_hypo_removed(
         self,
@@ -565,20 +577,18 @@ class RepairPlanner:
         chairs_param_hypo: np.ndarray,
         chair_pose: np.ndarray,
         result: PlanningResult,
-    ) -> bool:
+    ) -> SubProblemStatus:
         bools = tree_hypo.is_reachable_batch(self.final_pr2_pose_cands.T, 0.5)
         reachable_poses = self.final_pr2_pose_cands[bools]
         if len(reachable_poses) == 0:
-            print("no feasible base pose found even after completely removing the chair")
-            return False
+            return SubProblemStatus.NO_REACHEBLE_FINAL_BASE_POSE
 
         ground_mat = create_map_from_chair_param(chairs_param_hypo)
         gripper_pose_tile = np.tile(self.problem.reaching_pose, (reachable_poses.shape[0], 1))
         vectors = np.concatenate([reachable_poses, gripper_pose_tile], axis=1)
         is_feasibiles, min_indices = self.common.engine.infer(vectors, self.table_mat, ground_mat)
         if not np.any(is_feasibiles):
-            print("the arm planning is not feasible even after completely removing the chair")
-            return False
+            return SubProblemStatus.NO_FEASIBLE_ARM_PLAN
 
         feasible_pr2_final_pose = None
         for pr2_final_pose, is_feasible, min_idx in zip(
@@ -603,14 +613,15 @@ class RepairPlanner:
             result.is_rarm = reaching_task.is_using_rarm()
             break
         if feasible_pr2_final_pose is None:
-            print("no feasible solution found")
-            return False
+            return SubProblemStatus.NO_FEASIBLE_ARM_PLAN
 
         # NOTE: this path is temporary and will be replaced by the actual path
         result.base_path_final = Trajectory(tree_hypo.get_solution(feasible_pr2_final_pose).T)
-        return True
+        return SubProblemStatus.SUCCESS
 
-    def plan_base_motion_move_chair(self, sdf_hypo: UnionSDF, result: PlanningResult) -> bool:
+    def plan_base_motion_move_chair(
+        self, sdf_hypo: UnionSDF, result: PlanningResult
+    ) -> SubProblemStatus:
         assert result.base_path_final is not None
         base_final_path_tentative = result.base_path_final.resample(100).numpy()
 
@@ -659,13 +670,12 @@ class RepairPlanner:
             valid_post_remove_chair_pose = chair_pose
             break
         if valid_post_remove_pr2_pose is None:
-            print("no feasible solution found")
-            return False
+            return SubProblemStatus.NO_FEAIBLE_CHAIR_PLACEMENT
         result.base_path_to_post_remove_chair = Trajectory(
             tree_chair_attach.get_solution(valid_post_remove_pr2_pose).T
         )
         result.tmp = valid_post_remove_chair_pose
-        return True
+        return SubProblemStatus.SUCCESS
 
 
 class SceneVisualizer:
