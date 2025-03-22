@@ -311,6 +311,7 @@ class CommonResource:
         ompl_solver_config = OMPLSolverConfig(
             refine_seq=[
                 RefineType.SHORTCUT,
+                RefineType.BSPLINE,
                 RefineType.SHORTCUT,
                 RefineType.BSPLINE,
             ]
@@ -678,11 +679,11 @@ class RepairPlanner:
         self, chairs_param: np.ndarray, result: PlanningResult
     ) -> SubProblemStatus:
         assert result.base_path_final is not None
-        base_final_path_tentative = result.base_path_final.resample(100).numpy()
 
         assert result.base_path_to_pre_remove_chair is not None
+        start_base_pose = result.base_path_to_pre_remove_chair[-1]
         tree_chair_attach = self.common.build_base_motion_tree(
-            result.base_path_to_pre_remove_chair[-1], chairs_param, grasping_chair=True
+            start_base_pose, chairs_param, grasping_chair=True
         )
 
         self.common.pr2_model.angle_vector(AV_INIT)
@@ -690,11 +691,13 @@ class RepairPlanner:
             self.common.pr2_model
         )  # reset the kin model
         nodes = tree_chair_attach.get_debug_states()
-        dists = np.linalg.norm(nodes[:, :2] - base_final_path_tentative[-1, :2], axis=1)
+        dists = np.linalg.norm(nodes[:, :2] - start_base_pose[:2], axis=1)
         sorted_indices = np.argsort(dists)
 
         valid_post_remove_pr2_pose = None
         valid_post_remove_chair_pose = None
+
+        base_final_path_tentative = result.base_path_final.resample(100).numpy()
         for ind in sorted_indices:
             post_remove_pr2_pose = nodes[ind]
             # check if post_remove_pr2_pose is collision free (this is required because we only know that this position is collision free at the grasping pose)
