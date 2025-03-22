@@ -4,7 +4,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -231,6 +231,8 @@ class CommonResource:
     pr2_model: RobotModel
     collision_cst_base_only: SphereCollisionCst
     collision_cst_with_chair: SphereCollisionCst
+    sdf_cache: Dict[str, UnionSDF]
+    tree_cache: Dict[str, MultiGoalRRT]
 
     def __init__(self):
         self.sampler = SituationSampler()
@@ -272,10 +274,23 @@ class CommonResource:
         collision_cst_with_chair = coll_cst_with_chair
         self.collision_cst_with_chair = collision_cst_with_chair
 
+        # prepare cache
+        self.sdf_cache = {}
+        self.tree_cache = {}
+
+    def compute_chairs_param_hash(self, chairs_param: np.ndarray) -> str:
+        return hashlib.md5(chairs_param.tobytes()).hexdigest()[:8]
+
     def create_sdf_table_and_chairs(self, chairs_param: np.ndarray) -> UnionSDF:
+        key = self.compute_chairs_param_hash(chairs_param)
+
+        if key in self.sdf_cache:
+            return self.sdf_cache[key]
+
         self.chair_manager.set_param(chairs_param)
         sdf = self.chair_manager.create_sdf()
         sdf.merge(self.table.create_sdf())
+        self.sdf_cache[key] = sdf
         return sdf
 
     def solve_base_motion_planning(
@@ -316,19 +331,25 @@ class CommonResource:
         return ret.traj
 
     def build_base_motion_tree(
-        self, current_pose: np.ndarray, sdf: UnionSDF, grasping_chair: bool
+        self, current_pose: np.ndarray, chairs_param: np.ndarray, grasping_chair: bool
     ) -> MultiGoalRRT:
+        key = self.compute_chairs_param_hash(chairs_param) + "-" + str(grasping_chair)
+        if key in self.tree_cache:
+            return self.tree_cache[key]
+
         if grasping_chair:
             angle_vector = AV_CHAIR_GRASP
             cst = self.collision_cst_with_chair
         else:
             angle_vector = AV_INIT
             cst = self.collision_cst_base_only
+        sdf = self.create_sdf_table_and_chairs(chairs_param)
         cst.set_sdf(sdf)
 
         self.pr2_model.angle_vector(angle_vector)
         self.base_spec.reflect_skrobot_model_to_kin(self.pr2_model)
         tree = MultiGoalRRT(current_pose, self.pr2_pose_lb, self.pr2_pose_ub, cst, 2000)
+        self.tree_cache[key] = tree
         return tree
 
 
@@ -360,10 +381,10 @@ class TaskPlanner:
         self.common.chair_manager.set_param(problem.chairs_param)
         pr2_pose_cands = self._sample_pr2_pose()
         if pr2_pose_cands is None:
+            print("no feasible pr2 pose found")
             return None  # no solution found
-        sdf_now = self.common.create_sdf_table_and_chairs(problem.chairs_param)
         tree_now = self.common.build_base_motion_tree(
-            problem.pr2_pose_now, sdf_now, grasping_chair=False
+            problem.pr2_pose_now, problem.chairs_param, grasping_chair=False
         )
         bools = tree_now.is_reachable_batch(pr2_pose_cands.T, 0.5)
 
@@ -490,17 +511,14 @@ class RepairPlanner:
                 chair_param_first, chairs_param_hypo = self.split_chair_param(
                     chairs_param_original, i_chair_remove_first
                 )
-                sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
                 tree_hypo = self.common.build_base_motion_tree(
-                    self.problem.pr2_pose_now, sdf_hypo, grasping_chair=False
+                    self.problem.pr2_pose_now, chairs_param_hypo, grasping_chair=False
                 )
                 status = self.plan_base_motion_to_chair_grasp_pose(
                     chair_param_first, tree_hypo, PlanningResult()
                 )
                 if not status.is_success:
-                    print("fuck1")
                     continue
-                print("fuck2")
 
                 result, status = self.plan_single(chairs_param_hypo, i_chair_remove_final_shift)
                 if result is not None:
@@ -523,7 +541,7 @@ class RepairPlanner:
         # check if i_chair can be graspable
         sdf_now = self.common.create_sdf_table_and_chairs(chairs_param_now)
         tree_now = self.common.build_base_motion_tree(
-            self.problem.pr2_pose_now, sdf_now, grasping_chair=False
+            self.problem.pr2_pose_now, chairs_param_now, grasping_chair=False
         )
         status = self.plan_base_motion_to_chair_grasp_pose(
             chair_pose_remove, tree_now, planning_result
@@ -532,9 +550,8 @@ class RepairPlanner:
             return None, status
 
         # build tree for the hypothetical environment
-        sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
         tree_hypo = self.common.build_base_motion_tree(
-            self.problem.pr2_pose_now, sdf_hypo, grasping_chair=False
+            self.problem.pr2_pose_now, chairs_param_hypo, grasping_chair=False
         )
 
         # check if plan is feasible after removing the chair
@@ -546,7 +563,7 @@ class RepairPlanner:
         feasible_pr2_final_pose = planning_result.base_path_final[-1]
 
         # check if feasible placment of the chair is possible
-        status = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
+        status = self.plan_base_motion_move_chair(chairs_param_hypo, planning_result)
         if not status.is_success:
             return None, status
         valid_post_remove_chair_pose = planning_result.tmp  # FIXME: this is temporary
@@ -570,6 +587,7 @@ class RepairPlanner:
             grasping_chair=False,
         )
 
+        sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
         planning_result.base_path_to_post_remove_chair = self.common.solve_base_motion_planning(
             planning_result.base_path_to_post_remove_chair[0],
             planning_result.base_path_to_post_remove_chair[-1],
@@ -657,14 +675,14 @@ class RepairPlanner:
         return SubProblemStatus.SUCCESS
 
     def plan_base_motion_move_chair(
-        self, sdf_hypo: UnionSDF, result: PlanningResult
+        self, chairs_param: np.ndarray, result: PlanningResult
     ) -> SubProblemStatus:
         assert result.base_path_final is not None
         base_final_path_tentative = result.base_path_final.resample(100).numpy()
 
         assert result.base_path_to_pre_remove_chair is not None
         tree_chair_attach = self.common.build_base_motion_tree(
-            result.base_path_to_pre_remove_chair[-1], sdf_hypo, grasping_chair=True
+            result.base_path_to_pre_remove_chair[-1], chairs_param, grasping_chair=True
         )
 
         self.common.pr2_model.angle_vector(AV_INIT)
@@ -680,6 +698,7 @@ class RepairPlanner:
         for ind in sorted_indices:
             post_remove_pr2_pose = nodes[ind]
             # check if post_remove_pr2_pose is collision free (this is required because we only know that this position is collision free at the grasping pose)
+            sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param)
             self.common.collision_cst_base_only.set_sdf(sdf_hypo)
             if not self.common.collision_cst_base_only.is_valid(post_remove_pr2_pose):
                 continue
