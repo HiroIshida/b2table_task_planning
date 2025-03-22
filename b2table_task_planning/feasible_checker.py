@@ -466,31 +466,67 @@ class RepairPlanner:
         self.final_pr2_pose_cands = final_pr2_pose_cands
         self.table_mat = table_mat
         self.tree_current = tree_current
-        self.sdf_original = self.common.create_sdf_table_and_chairs(problem.chairs_param)
 
     def plan(self, chairs_param_original: np.ndarray) -> Optional[PlanningResult]:
-
         n_chair = len(chairs_param_original) // 3
+        print(f"trying out single chair removal for {n_chair} chairs")
         for i_chair in range(n_chair):
             result, status = self.plan_single(chairs_param_original, i_chair)
             if result is not None:
                 return result
+
+        def range_except(i_except: int, n: int):
+            return (j for j in range(n) if j != i_except)
+
+        for i_chair_remove_final in range(n_chair):
+            for i_chair_remove_first in range_except(i_chair_remove_final, n_chair):
+                print(f"dual removal for {i_chair_remove_first} and {i_chair_remove_final}")
+
+                if i_chair_remove_first < i_chair_remove_final:
+                    i_chair_remove_final_shift = i_chair_remove_final - 1
+                else:
+                    i_chair_remove_final_shift = i_chair_remove_final
+
+                chair_param_first, chairs_param_hypo = self.split_chair_param(
+                    chairs_param_original, i_chair_remove_first
+                )
+                sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
+                tree_hypo = self.common.build_base_motion_tree(
+                    self.problem.pr2_pose_now, sdf_hypo, grasping_chair=False
+                )
+                status = self.plan_base_motion_to_chair_grasp_pose(
+                    chair_param_first, tree_hypo, PlanningResult()
+                )
+                if not status.is_success:
+                    print("fuck1")
+                    continue
+                print("fuck2")
+
+                result, status = self.plan_single(chairs_param_hypo, i_chair_remove_final_shift)
+                if result is not None:
+                    print(f"repair!!!")
+                else:
+                    # print status enum field
+                    print(f"status: {status}")
         return None
 
     def plan_single(
         self, chairs_param_now: np.ndarray, remove_chair_idx: int
     ) -> Tuple[Optional[PlanningResult], SubProblemStatus]:
         print(f"trying hypothetical repair for chair {remove_chair_idx}")
-        chair_pose_remove = chairs_param_now[remove_chair_idx * 3 : (remove_chair_idx + 1) * 3]
-        chairs_param_hypo = np.delete(
-            chairs_param_now, np.s_[3 * remove_chair_idx : 3 * remove_chair_idx + 3]
+        chair_pose_remove, chairs_param_hypo = self.split_chair_param(
+            chairs_param_now, remove_chair_idx
         )
         planning_result = PlanningResult()
         planning_result.remove_chair_idx = remove_chair_idx
 
         # check if i_chair can be graspable
+        sdf_now = self.common.create_sdf_table_and_chairs(chairs_param_now)
+        tree_now = self.common.build_base_motion_tree(
+            self.problem.pr2_pose_now, sdf_now, grasping_chair=False
+        )
         status = self.plan_base_motion_to_chair_grasp_pose(
-            chair_pose_remove, self.tree_current, planning_result
+            chair_pose_remove, tree_now, planning_result
         )
         if not status.is_success:
             return None, status
@@ -530,7 +566,7 @@ class RepairPlanner:
         planning_result.base_path_to_pre_remove_chair = self.common.solve_base_motion_planning(
             planning_result.base_path_to_pre_remove_chair[0],
             planning_result.base_path_to_pre_remove_chair[-1],
-            self.sdf_original,
+            sdf_now,
             grasping_chair=False,
         )
 
