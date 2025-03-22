@@ -458,69 +458,75 @@ class RepairPlanner:
 
         n_chair = len(chairs_param_original) // 3
         for i_chair in range(n_chair):
-            print(f"trying hypothetical repair for chair {i_chair}")
-            chair_pose_remove = chairs_param_original[i_chair * 3 : (i_chair + 1) * 3]
-            chairs_param_hypo = np.delete(
-                chairs_param_original, np.s_[3 * i_chair : 3 * i_chair + 3]
-            )
-            planning_result = PlanningResult()
-            planning_result.remove_chair_idx = i_chair
-
-            # check if i_chair can be graspable
-            success = self.plan_base_motion_to_chair_grasp_pose(
-                chair_pose_remove, self.tree_current, planning_result
-            )
-            if not success:
-                continue
-
-            # build tree for the hypothetical environment
-            sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
-            tree_hypo = self.common.build_base_motion_tree(
-                self.problem.pr2_pose_now, sdf_hypo, grasping_chair=False
-            )
-
-            # check if plan is feasible after removing the chair
-            success = self.plan_base_and_arm_hypo_removed(
-                tree_hypo, chairs_param_hypo, chair_pose_remove, planning_result
-            )
-            if not success:
-                continue
-            feasible_pr2_final_pose = planning_result.base_path_final[-1]
-
-            # check if feasible placment of the chair is possible
-            success = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
-            if not success:
-                continue
-            valid_post_remove_chair_pose = planning_result.tmp  # FIXME: this is temporary
-
-            # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
-            sdf_post_remove = self.common.create_sdf_table_and_chairs(
-                np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
-            )
-            planning_result.base_path_final = self.common.solve_base_motion_planning(
-                planning_result.base_path_to_post_remove_chair[-1],
-                feasible_pr2_final_pose,
-                sdf_post_remove,
-                grasping_chair=False,
-            )
-
-            # optionally? sommoth out the trajectories which are already feasible
-            planning_result.base_path_to_pre_remove_chair = self.common.solve_base_motion_planning(
-                planning_result.base_path_to_pre_remove_chair[0],
-                planning_result.base_path_to_pre_remove_chair[-1],
-                self.sdf_original,
-                grasping_chair=False,
-            )
-
-            planning_result.base_path_to_post_remove_chair = self.common.solve_base_motion_planning(
-                planning_result.base_path_to_post_remove_chair[0],
-                planning_result.base_path_to_post_remove_chair[-1],
-                sdf_hypo,
-                grasping_chair=True,
-            )
-            return planning_result
-        print("tried to repair the environment but failed")
+            result = self.plan_single(chairs_param_original, i_chair)
+            if result is not None:
+                return result
         return None
+
+    def plan_single(
+        self, chairs_param_now: np.ndarray, remove_chair_idx: int
+    ) -> Optional[PlanningResult]:
+        print(f"trying hypothetical repair for chair {remove_chair_idx}")
+        chair_pose_remove = chairs_param_now[remove_chair_idx * 3 : (remove_chair_idx + 1) * 3]
+        chairs_param_hypo = np.delete(
+            chairs_param_now, np.s_[3 * remove_chair_idx : 3 * remove_chair_idx + 3]
+        )
+        planning_result = PlanningResult()
+        planning_result.remove_chair_idx = remove_chair_idx
+
+        # check if i_chair can be graspable
+        success = self.plan_base_motion_to_chair_grasp_pose(
+            chair_pose_remove, self.tree_current, planning_result
+        )
+        if not success:
+            return None
+
+        # build tree for the hypothetical environment
+        sdf_hypo = self.common.create_sdf_table_and_chairs(chairs_param_hypo)
+        tree_hypo = self.common.build_base_motion_tree(
+            self.problem.pr2_pose_now, sdf_hypo, grasping_chair=False
+        )
+
+        # check if plan is feasible after removing the chair
+        success = self.plan_base_and_arm_hypo_removed(
+            tree_hypo, chairs_param_hypo, chair_pose_remove, planning_result
+        )
+        if not success:
+            return None
+        feasible_pr2_final_pose = planning_result.base_path_final[-1]
+
+        # check if feasible placment of the chair is possible
+        success = self.plan_base_motion_move_chair(sdf_hypo, planning_result)
+        if not success:
+            return None
+        valid_post_remove_chair_pose = planning_result.tmp  # FIXME: this is temporary
+
+        # finalizing the plan connecting post_remove_pr2_pose and final_pr2_pose
+        sdf_post_remove = self.common.create_sdf_table_and_chairs(
+            np.hstack([chairs_param_hypo, valid_post_remove_chair_pose])
+        )
+        planning_result.base_path_final = self.common.solve_base_motion_planning(
+            planning_result.base_path_to_post_remove_chair[-1],
+            feasible_pr2_final_pose,
+            sdf_post_remove,
+            grasping_chair=False,
+        )
+
+        # optionally? sommoth out the trajectories which are already feasible
+        planning_result.base_path_to_pre_remove_chair = self.common.solve_base_motion_planning(
+            planning_result.base_path_to_pre_remove_chair[0],
+            planning_result.base_path_to_pre_remove_chair[-1],
+            self.sdf_original,
+            grasping_chair=False,
+        )
+
+        planning_result.base_path_to_post_remove_chair = self.common.solve_base_motion_planning(
+            planning_result.base_path_to_post_remove_chair[0],
+            planning_result.base_path_to_post_remove_chair[-1],
+            sdf_hypo,
+            grasping_chair=True,
+        )
+        return planning_result
 
     def plan_base_motion_to_chair_grasp_pose(
         self, chair_pose: np.ndarray, tree: MultiGoalRRT, result: PlanningResult
@@ -740,6 +746,7 @@ class SceneVisualizer:
 if __name__ == "__main__":
     np.random.seed(1)
     set_random_seed(0)
+    # task = need_dual_fix_task()
     task = need_fix_task()
     task_planner = TaskPlanner()
     problem = PlanningProblem(
